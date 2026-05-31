@@ -39,7 +39,10 @@ const PORT = parseInt(process.env.PORT ?? "8080", 10);
 const DIST_DIR = path.join(__dirname, "dist");
 
 // ─── NVIDIA OAuth2 constants ────────────────────────────────────────────────
-const NVIDIA_CLIENT_ID = process.env.NVIDIA_CLIENT_ID ?? "";
+// Fallback to the OpenNOW desktop app's own client_id (extracted from auth.ts).
+// Override with NVIDIA_CLIENT_ID env var to use a different client (e.g. the
+// official NVIDIA desktop app's embedded credentials for the nvapp:// trick).
+const NVIDIA_CLIENT_ID = process.env.NVIDIA_CLIENT_ID ?? "ZU7sPN-miLujMD95LfOQ453IB0AtjM8sMyvgJ9wCXEQ";
 const NVIDIA_CLIENT_SECRET = process.env.NVIDIA_CLIENT_SECRET ?? "";
 const APP_BASE_URL = (process.env.APP_BASE_URL ?? "").replace(/\/$/, "");
 
@@ -68,11 +71,16 @@ function isClientInterceptedRedirectUri(uri) {
   return false;
 }
 
-const NVIDIA_AUTH_URL = "https://login.nvgs.nvidia.com/v1/authorize";
-const NVIDIA_TOKEN_URL = "https://login.nvgs.nvidia.com/v1/token";
-const NVIDIA_USERINFO_URL = "https://login.nvgs.nvidia.com/v1/userinfo";
-const NVIDIA_REVOKE_URL = "https://login.nvgs.nvidia.com/v1/revoke";
-const NVIDIA_OAUTH_SCOPES = "openid profile email offline_access";
+// ── Endpoints sourced from the OpenNOW desktop app's auth.ts ────────────────
+const NVIDIA_AUTH_URL = "https://login.nvidia.com/authorize";
+const NVIDIA_TOKEN_URL = "https://login.nvidia.com/token";
+const NVIDIA_CLIENT_TOKEN_URL = "https://login.nvidia.com/client_token";
+const NVIDIA_USERINFO_URL = "https://login.nvidia.com/userinfo";
+const NVIDIA_REVOKE_URL = "https://login.nvidia.com/revoke";
+// Scopes must match exactly what the desktop client sends
+const NVIDIA_OAUTH_SCOPES = "openid consent email tk_client age";
+// Default IDP ID used by the desktop NVIDIA login provider
+const DEFAULT_IDP_ID = "PDiAhv2kJTFeQ7WOPqiQ2tRZ7lGhR2X11dXvM4TZSxg";
 
 // GFN API base URL – comes from the provider but this is the production default.
 // Override with GFN_STREAMING_BASE_URL env var if needed.
@@ -106,6 +114,43 @@ function generateCodeChallenge(verifier) {
   return crypto.createHash("sha256").update(verifier).digest("base64url");
 }
 
+// ─── NVIDIA-specific helpers ────────────────────────────────────────────────
+
+// Stable device_id: the desktop app hashes hostname:username:opennow-stable.
+// Server-side we don't have a per-user hostname, so we use a stable value
+// derived from the server identity (consistent across restarts).
+const SERVER_DEVICE_ID = crypto
+  .createHash("sha256")
+  .update(`opennow-web:${process.env.APP_BASE_URL ?? "localhost"}:opennow-stable`)
+  .digest("hex");
+
+// Headers that mirror what the desktop app's buildNvidiaAuthHeaders sends.
+// The GFN auth server checks User-Agent and Referer; without them token
+// exchanges can silently fail with a 4xx.
+const GFN_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 GFNClient/2.0";
+
+function nvidiaAuthHeaders(extra = {}) {
+  return {
+    "User-Agent": GFN_USER_AGENT,
+    Referer: "https://login.nvidia.com/",
+    Origin: "https://login.nvidia.com",
+    ...extra,
+  };
+}
+
+// Minimal JWT payload decoder – no validation, just extract claims.
+function parseJwtPayload(token) {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const json = Buffer.from(parts[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
 // ─── GFN API proxy helper ───────────────────────────────────────────────────
 async function gfnFetch(url, accessToken, options = {}) {
   const headers = {
@@ -131,15 +176,17 @@ async function gfnFetch(url, accessToken, options = {}) {
 
 // ─── Token refresh ─────────────────────────────────────────────────────────
 async function refreshAccessToken(refreshToken) {
+  // auth.ts refreshAuthTokens: refresh DOES include client_id
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
     client_id: NVIDIA_CLIENT_ID,
-    ...(NVIDIA_CLIENT_SECRET ? { client_secret: NVIDIA_CLIENT_SECRET } : {}),
   });
   const res = await fetch(NVIDIA_TOKEN_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: nvidiaAuthHeaders({
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    }),
     body,
   });
   if (!res.ok) throw new Error(`Token refresh failed: ${res.status}`);
@@ -205,18 +252,6 @@ app.get("/api/auth/providers", async (_req, res) => {
 // GET /api/auth/login?provider=nvidia
 // Initiates the OAuth PKCE flow. This is opened in a popup by the web-shim.
 app.get("/api/auth/login", (req, res) => {
-  if (!NVIDIA_CLIENT_ID) {
-    return res.status(503).send(
-      `<html><body style="font-family:sans-serif;padding:2rem">
-        <h2>⚠️ NVIDIA_CLIENT_ID not configured</h2>
-        <p>Set the <code>NVIDIA_CLIENT_ID</code> (and optionally <code>NVIDIA_CLIENT_SECRET</code> and <code>APP_BASE_URL</code>) environment variables on your Koyeb deployment.</p>
-        <p>You need to <a href="https://developer.nvidia.com/" target="_blank">register an OAuth app with NVIDIA</a> and set the redirect URI to:<br>
-        <code>${REDIRECT_URI}</code></p>
-        <script>window.opener?.postMessage({ type: 'auth_error', error: 'NVIDIA_CLIENT_ID not set' }, '*');</script>
-      </body></html>`
-    );
-  }
-
   const codeVerifier = generateCodeVerifier();
   const codeChallenge = generateCodeChallenge(codeVerifier);
   const state = crypto.randomBytes(16).toString("hex");
@@ -225,14 +260,20 @@ app.get("/api/auth/login", (req, res) => {
   req.session.oauthCodeVerifier = codeVerifier;
   req.session.oauthProvider = req.query.provider ?? "nvidia";
 
+  const nonce = crypto.randomBytes(16).toString("hex");
   const params = new URLSearchParams({
     response_type: "code",
+    device_id: SERVER_DEVICE_ID,
+    scope: NVIDIA_OAUTH_SCOPES,
     client_id: NVIDIA_CLIENT_ID,
     redirect_uri: REDIRECT_URI,
-    scope: NVIDIA_OAUTH_SCOPES,
-    state,
+    ui_locales: "en_US",
+    nonce,
+    prompt: "select_account",
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
+    idp_id: DEFAULT_IDP_ID,
+    state,
   });
 
   res.redirect(`${NVIDIA_AUTH_URL}?${params}`);
@@ -254,18 +295,20 @@ app.get("/api/auth/callback", async (req, res) => {
   try {
     const codeVerifier = req.session.oauthCodeVerifier;
 
+    // auth.ts does NOT send client_id in the authorization_code exchange body –
+    // NVIDIA identifies the client via the PKCE code_challenge it already has.
     const tokenBody = new URLSearchParams({
       grant_type: "authorization_code",
       code: String(code),
       redirect_uri: REDIRECT_URI,
-      client_id: NVIDIA_CLIENT_ID,
       code_verifier: codeVerifier,
-      ...(NVIDIA_CLIENT_SECRET ? { client_secret: NVIDIA_CLIENT_SECRET } : {}),
     });
 
     const tokenRes = await fetch(NVIDIA_TOKEN_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: nvidiaAuthHeaders({
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      }),
       body: tokenBody,
     });
     if (!tokenRes.ok) {
@@ -282,8 +325,29 @@ app.get("/api/auth/callback", async (req, res) => {
       expiresAt: now + (tokenData.expires_in ?? 3600),
     };
 
-    // Fetch user profile
-    const userInfo = await gfnFetch(NVIDIA_USERINFO_URL, tokens.accessToken);
+    // Mirror auth.ts fetchUserInfo: decode the JWT first; only hit /userinfo
+    // if the JWT lacks the fields we need (avoids an extra round-trip).
+    const jwtToken = tokens.idToken ?? tokens.accessToken;
+    const claims = parseJwtPayload(jwtToken);
+    let userInfo;
+    if (claims?.sub && (claims.email || claims.picture || claims.preferred_username)) {
+      userInfo = {
+        sub: claims.sub,
+        name: claims.preferred_username ?? claims.email?.split("@")[0] ?? "NVIDIA User",
+        email: claims.email ?? null,
+        picture: claims.picture ?? null,
+        membershipTier: claims.gfn_tier ?? "FREE",
+      };
+    } else {
+      const uiRes = await fetch(NVIDIA_USERINFO_URL, {
+        headers: nvidiaAuthHeaders({
+          Authorization: `Bearer ${tokens.accessToken}`,
+          Accept: "application/json",
+        }),
+      });
+      if (!uiRes.ok) throw new Error(`Userinfo fetch failed (${uiRes.status})`);
+      userInfo = await uiRes.json();
+    }
 
     const authSession = {
       provider: {
@@ -401,12 +465,14 @@ app.get("/api/auth/accounts", (req, res) => {
 
 // Allowed GFN API domains (allowlist to prevent SSRF)
 const GFN_ALLOWED_HOSTS = [
+  "login.nvidia.com",           // auth endpoints (login.nvidia.com/authorize|token|userinfo)
+  "pcs.geforcenow.com",         // service URLs / provider discovery
   "api.prod.nvidia.com",
   "api.nvidiagfn.com",
   "cloudmatch.nvidiagrid.net",
   "cloudmatchbeta.nvidiagrid.net",
   "geforcenow.nvidiagrid.net",
-  "login.nvgs.nvidia.com",
+  "login.nvgs.nvidia.com",      // kept for any legacy calls
 ];
 
 function isAllowedGfnUrl(urlStr) {
@@ -520,10 +586,6 @@ app.post("/api/gfn/call", async (req, res) => {
 // stores them in the session, and returns the full NVIDIA authorize URL.
 // The browser opens this URL directly in the popup.
 app.get("/api/auth/authorize-url", (req, res) => {
-  if (!NVIDIA_CLIENT_ID) {
-    return res.status(503).json({ error: "NVIDIA_CLIENT_ID not configured" });
-  }
-
   const codeVerifier = generateCodeVerifier();
   const codeChallenge = generateCodeChallenge(codeVerifier);
   const state = crypto.randomBytes(16).toString("hex");
@@ -532,14 +594,20 @@ app.get("/api/auth/authorize-url", (req, res) => {
   req.session.oauthCodeVerifier = codeVerifier;
   req.session.oauthProvider = req.query.provider ?? "nvidia";
 
+  const nonce = crypto.randomBytes(16).toString("hex");
   const params = new URLSearchParams({
     response_type: "code",
+    device_id: SERVER_DEVICE_ID,
+    scope: NVIDIA_OAUTH_SCOPES,
     client_id: NVIDIA_CLIENT_ID,
     redirect_uri: REDIRECT_URI,
-    scope: NVIDIA_OAUTH_SCOPES,
-    state,
+    ui_locales: "en_US",
+    nonce,
+    prompt: "select_account",
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
+    idp_id: DEFAULT_IDP_ID,
+    state,
   });
 
   res.json({
@@ -569,18 +637,20 @@ app.post("/api/auth/exchange", async (req, res) => {
   }
 
   try {
+    // Drop client_id from the exchange body – auth.ts confirms NVIDIA does not
+    // expect it here (the PKCE verifier is the proof of identity).
     const tokenBody = new URLSearchParams({
       grant_type: "authorization_code",
       code: String(code),
       redirect_uri: REDIRECT_URI,
-      client_id: NVIDIA_CLIENT_ID,
       code_verifier: codeVerifier,
-      ...(NVIDIA_CLIENT_SECRET ? { client_secret: NVIDIA_CLIENT_SECRET } : {}),
     });
 
     const tokenRes = await fetch(NVIDIA_TOKEN_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: nvidiaAuthHeaders({
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      }),
       body: tokenBody,
     });
 
@@ -598,7 +668,28 @@ app.post("/api/auth/exchange", async (req, res) => {
       expiresAt: now + (tokenData.expires_in ?? 3600),
     };
 
-    const userInfo = await gfnFetch(NVIDIA_USERINFO_URL, tokens.accessToken);
+    // JWT-first user info (mirrors auth.ts fetchUserInfo)
+    const jwtToken = tokens.idToken ?? tokens.accessToken;
+    const claims = parseJwtPayload(jwtToken);
+    let userInfo;
+    if (claims?.sub && (claims.email || claims.picture || claims.preferred_username)) {
+      userInfo = {
+        sub: claims.sub,
+        name: claims.preferred_username ?? claims.email?.split("@")[0] ?? "NVIDIA User",
+        email: claims.email ?? null,
+        picture: claims.picture ?? null,
+        membershipTier: claims.gfn_tier ?? "FREE",
+      };
+    } else {
+      const uiRes = await fetch(NVIDIA_USERINFO_URL, {
+        headers: nvidiaAuthHeaders({
+          Authorization: `Bearer ${tokens.accessToken}`,
+          Accept: "application/json",
+        }),
+      });
+      if (!uiRes.ok) throw new Error(`Userinfo fetch failed (${uiRes.status})`);
+      userInfo = await uiRes.json();
+    }
 
     req.session.authSession = {
       provider: {
@@ -696,13 +787,16 @@ app.get(/^(?!\/api\/).*$/, (_req, res) => {
 // ─── Start ─────────────────────────────────────────────────────────────────
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`[opennow-web] Listening on http://0.0.0.0:${PORT}`);
-  if (!NVIDIA_CLIENT_ID) {
-    console.warn("[opennow-web] ⚠️  NVIDIA_CLIENT_ID is not set — login will not work.");
-    console.warn("[opennow-web]    Set NVIDIA_CLIENT_ID (extracted from the desktop app bundle or your own NVIDIA dev registration).");
-    console.warn("[opennow-web]    Optionally set NVIDIA_REDIRECT_URI to use the desktop-app trick (e.g. nvapp://auth/callback).");
+  const mode = isClientInterceptedRedirectUri(REDIRECT_URI) ? "client-intercepted popup" : "server-side callback";
+  console.log(`[opennow-web] OAuth mode: ${mode} — redirect URI: ${REDIRECT_URI}`);
+  if (process.env.NVIDIA_CLIENT_ID) {
+    console.log(`[opennow-web] Using custom NVIDIA_CLIENT_ID from env`);
   } else {
-    const mode = isClientInterceptedRedirectUri(REDIRECT_URI) ? "client-intercepted popup" : "server-side callback";
-    console.log(`[opennow-web] OAuth mode: ${mode} — redirect URI: ${REDIRECT_URI}`);
+    console.log(`[opennow-web] Using built-in OpenNOW desktop client_id (default)`);
+    console.log(`[opennow-web] For Mode 3 (nvapp:// trick) set NVIDIA_CLIENT_ID + NVIDIA_REDIRECT_URI from the official NVIDIA desktop app bundle`);
+  }
+  if (!NVIDIA_REDIRECT_URI) {
+    console.log(`[opennow-web] Tip: set NVIDIA_REDIRECT_URI=nvapp://auth/callback (or another custom scheme) to enable the desktop-app interception trick`);
   }
   if (!process.env.SESSION_SECRET) {
     console.warn("[opennow-web] ⚠️  SESSION_SECRET is not set — using insecure default. Set it in production!");
