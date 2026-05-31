@@ -1,0 +1,48 @@
+{
+  "name": "opennow-stable",
+  "version": "0.4.0",
+  "description": "OpenNOW web client (converted from Electron)",
+  "author": {
+    "name": "zortos293",
+    "email": "zortos293@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/OpenCloudGaming/OpenNOW",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OpenCloudGaming/OpenNOW.git"
+  },
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node server.js",
+    "dist": "npm run build",
+    "dist:signed": "npm run build",
+    "lint": "oxlint src",
+    "locales:check": "node scripts/check-translations.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.json",
+    "test": "node scripts/run-tests.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "express-session": "^1.18.1",
+    "lucide-react": "^1.17.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/express-session": "^1.18.1",
+    "@types/node": "^22.19.17",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.2.0",
+    "oxlint": "^1.67.0",
+    "react-scan": "^0.5.3",
+    "tsx": "^4.22.3",
+    "typescript": "^6.0.3",
+    "vite": "^7.3.1"
+  }
+}
