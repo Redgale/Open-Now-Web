@@ -162,16 +162,45 @@ function openLoginPopup(provider: string): Promise<void> {
         // - Cross-origin pages (nvidia.com) → throws SecurityError, we ignore.
         // - Same-origin redirect (/auth/relay) → relay script runs and posts
         //   auth_code back, but we also catch it here for redundancy.
-        // - Custom scheme (nvapp://) → after failed navigation the popup may
-        //   end up at about:blank which IS readable; we check for the code there.
-        //   On some browsers the href briefly becomes the scheme URI before the
-        //   browser blocks it – extractCodeFromUrl handles that case.
+        // - Custom scheme (geforcenow://, nvapp://, etc.) → the browser cannot
+        //   navigate to a custom scheme, so it either:
+        //     a) briefly makes the href the scheme URL then goes to about:blank, or
+        //     b) stays on the last cross-origin page (throws SecurityError) then
+        //        goes to about:blank.
+        //   In case (b) the scheme URL is NEVER directly readable, so we must
+        //   check what caused the about:blank — store the last SecurityError
+        //   message, which some browsers include the target URL in.
+        //   More reliably: when we land on about:blank we check the document
+        //   referrer, which Chrome preserves as the scheme URL.
+        let lastReadableHref = "";
         const locationPoll = setInterval(async () => {
           if (settled) return;
           try {
             const href = popup.location.href;
-            if (!href || href === "about:blank") return;
+            if (!href) return;
 
+            if (href === "about:blank") {
+              // Browser navigated to about:blank after a failed custom-scheme redirect.
+              // Try reading document.referrer — Chrome preserves the scheme URL there.
+              let referrer = "";
+              try { referrer = popup.document.referrer; } catch { /* cross-origin */ }
+              const candidateUrl = referrer || lastReadableHref;
+              if (candidateUrl && candidateUrl !== "about:blank") {
+                const extracted = extractCodeFromUrl(candidateUrl);
+                if (extracted) {
+                  clearInterval(locationPoll);
+                  try {
+                    await exchangeCode(extracted.code, extracted.state);
+                    settle();
+                  } catch (e) {
+                    settle(e instanceof Error ? e : new Error(String(e)));
+                  }
+                }
+              }
+              return;
+            }
+
+            lastReadableHref = href;
             const extracted = extractCodeFromUrl(href);
             if (extracted) {
               clearInterval(locationPoll);

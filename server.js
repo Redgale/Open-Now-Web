@@ -72,15 +72,40 @@ function isClientInterceptedRedirectUri(uri) {
 }
 
 // ── Endpoints sourced from the OpenNOW desktop app's auth.ts ────────────────
-const NVIDIA_AUTH_URL = "https://login.nvidia.com/authorize";
-const NVIDIA_TOKEN_URL = "https://login.nvidia.com/token";
-const NVIDIA_CLIENT_TOKEN_URL = "https://login.nvidia.com/client_token";
-const NVIDIA_USERINFO_URL = "https://login.nvidia.com/userinfo";
-const NVIDIA_REVOKE_URL = "https://login.nvidia.com/revoke";
-// Scopes must match exactly what the desktop client sends
-const NVIDIA_OAUTH_SCOPES = "openid consent email tk_client age";
-// Default IDP ID used by the desktop NVIDIA login provider
-const DEFAULT_IDP_ID = "PDiAhv2kJTFeQ7WOPqiQ2tRZ7lGhR2X11dXvM4TZSxg";
+//
+// NVIDIA runs TWO separate OAuth clusters:
+//   login.nvidia.com      – GFN web / newer client registrations
+//   login.nvgs.nvidia.com – NVGS / native desktop clients (Linux, Windows GFN app)
+//
+// Override the base URL with NVIDIA_AUTH_BASE_URL to switch clusters.
+// e.g. NVIDIA_AUTH_BASE_URL=https://login.nvgs.nvidia.com
+//
+// You can also override individual endpoints if needed:
+//   NVIDIA_AUTH_URL      – full authorize endpoint
+//   NVIDIA_TOKEN_URL     – full token endpoint
+//   NVIDIA_USERINFO_URL  – full userinfo endpoint
+//   NVIDIA_REVOKE_URL    – full revoke endpoint
+//
+// Other tunables:
+//   NVIDIA_OAUTH_SCOPES  – space-separated scopes (default: openid consent email tk_client age)
+//   NVIDIA_IDP_ID        – idp_id param sent to authorize; leave blank to omit it entirely
+//   NVIDIA_SKIP_DEVICE_ID – set to "true" to omit device_id from the authorize request
+const _AUTH_BASE = (process.env.NVIDIA_AUTH_BASE_URL ?? "https://login.nvidia.com").replace(/\/$/, "");
+const NVIDIA_AUTH_URL        = process.env.NVIDIA_AUTH_URL     ?? `${_AUTH_BASE}/authorize`;
+const NVIDIA_TOKEN_URL       = process.env.NVIDIA_TOKEN_URL    ?? `${_AUTH_BASE}/token`;
+const NVIDIA_CLIENT_TOKEN_URL = `${_AUTH_BASE}/client_token`;
+const NVIDIA_USERINFO_URL    = process.env.NVIDIA_USERINFO_URL ?? `${_AUTH_BASE}/userinfo`;
+const NVIDIA_REVOKE_URL      = process.env.NVIDIA_REVOKE_URL   ?? `${_AUTH_BASE}/revoke`;
+// Scopes must match exactly what the registered client expects.
+// The NVGS/native clients typically use: openid email
+// The GFN web client uses:               openid consent email tk_client age
+const NVIDIA_OAUTH_SCOPES = process.env.NVIDIA_OAUTH_SCOPES ?? "openid consent email tk_client age";
+// idp_id: sent to the authorize endpoint to select the identity provider.
+// Leave NVIDIA_IDP_ID blank (or unset) to omit it — some client registrations
+// don't require it and including the wrong value causes auth failures.
+const NVIDIA_IDP_ID = (process.env.NVIDIA_IDP_ID ?? "PDiAhv2kJTFeQ7WOPqiQ2tRZ7lGhR2X11dXvM4TZSxg").trim();
+// Back-compat alias kept for internal use
+const DEFAULT_IDP_ID = NVIDIA_IDP_ID;
 
 // GFN API base URL – comes from the provider but this is the production default.
 // Override with GFN_STREAMING_BASE_URL env var if needed.
@@ -131,10 +156,11 @@ const GFN_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 GFNClient/2.0";
 
 function nvidiaAuthHeaders(extra = {}) {
+  const authOrigin = new URL(NVIDIA_AUTH_URL).origin;
   return {
     "User-Agent": GFN_USER_AGENT,
-    Referer: "https://login.nvidia.com/",
-    Origin: "https://login.nvidia.com",
+    Referer: `${authOrigin}/`,
+    Origin: authOrigin,
     ...extra,
   };
 }
@@ -263,7 +289,6 @@ app.get("/api/auth/login", (req, res) => {
   const nonce = crypto.randomBytes(16).toString("hex");
   const params = new URLSearchParams({
     response_type: "code",
-    device_id: SERVER_DEVICE_ID,
     scope: NVIDIA_OAUTH_SCOPES,
     client_id: NVIDIA_CLIENT_ID,
     redirect_uri: REDIRECT_URI,
@@ -272,9 +297,17 @@ app.get("/api/auth/login", (req, res) => {
     prompt: "select_account",
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
-    idp_id: DEFAULT_IDP_ID,
     state,
   });
+  // device_id: some client registrations require it, others reject it.
+  // Omit with NVIDIA_SKIP_DEVICE_ID=true.
+  if (process.env.NVIDIA_SKIP_DEVICE_ID !== "true") {
+    params.set("device_id", SERVER_DEVICE_ID);
+  }
+  // idp_id: omit entirely when NVIDIA_IDP_ID is set to empty string.
+  if (NVIDIA_IDP_ID) {
+    params.set("idp_id", NVIDIA_IDP_ID);
+  }
 
   res.redirect(`${NVIDIA_AUTH_URL}?${params}`);
 });
@@ -472,7 +505,7 @@ const GFN_ALLOWED_HOSTS = [
   "cloudmatch.nvidiagrid.net",
   "cloudmatchbeta.nvidiagrid.net",
   "geforcenow.nvidiagrid.net",
-  "login.nvgs.nvidia.com",      // kept for any legacy calls
+  "login.nvgs.nvidia.com",      // NVGS/native client auth (Linux/Windows desktop app registrations)
 ];
 
 function isAllowedGfnUrl(urlStr) {
@@ -597,7 +630,6 @@ app.get("/api/auth/authorize-url", (req, res) => {
   const nonce = crypto.randomBytes(16).toString("hex");
   const params = new URLSearchParams({
     response_type: "code",
-    device_id: SERVER_DEVICE_ID,
     scope: NVIDIA_OAUTH_SCOPES,
     client_id: NVIDIA_CLIENT_ID,
     redirect_uri: REDIRECT_URI,
@@ -606,9 +638,14 @@ app.get("/api/auth/authorize-url", (req, res) => {
     prompt: "select_account",
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
-    idp_id: DEFAULT_IDP_ID,
     state,
   });
+  if (process.env.NVIDIA_SKIP_DEVICE_ID !== "true") {
+    params.set("device_id", SERVER_DEVICE_ID);
+  }
+  if (NVIDIA_IDP_ID) {
+    params.set("idp_id", NVIDIA_IDP_ID);
+  }
 
   res.json({
     url: `${NVIDIA_AUTH_URL}?${params}`,
@@ -789,14 +826,14 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`[opennow-web] Listening on http://0.0.0.0:${PORT}`);
   const mode = isClientInterceptedRedirectUri(REDIRECT_URI) ? "client-intercepted popup" : "server-side callback";
   console.log(`[opennow-web] OAuth mode: ${mode} — redirect URI: ${REDIRECT_URI}`);
+  console.log(`[opennow-web] Auth base: ${_AUTH_BASE}`);
+  console.log(`[opennow-web] Scopes: ${NVIDIA_OAUTH_SCOPES}`);
+  console.log(`[opennow-web] idp_id: ${NVIDIA_IDP_ID || "(omitted)"}`);
+  console.log(`[opennow-web] device_id: ${process.env.NVIDIA_SKIP_DEVICE_ID === "true" ? "(omitted)" : SERVER_DEVICE_ID}`);
   if (process.env.NVIDIA_CLIENT_ID) {
     console.log(`[opennow-web] Using custom NVIDIA_CLIENT_ID from env`);
   } else {
     console.log(`[opennow-web] Using built-in OpenNOW desktop client_id (default)`);
-    console.log(`[opennow-web] For Mode 3 (nvapp:// trick) set NVIDIA_CLIENT_ID + NVIDIA_REDIRECT_URI from the official NVIDIA desktop app bundle`);
-  }
-  if (!NVIDIA_REDIRECT_URI) {
-    console.log(`[opennow-web] Tip: set NVIDIA_REDIRECT_URI=nvapp://auth/callback (or another custom scheme) to enable the desktop-app interception trick`);
   }
   if (!process.env.SESSION_SECRET) {
     console.warn("[opennow-web] ⚠️  SESSION_SECRET is not set — using insecure default. Set it in production!");
