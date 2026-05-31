@@ -42,38 +42,162 @@ async function gfnCall<T>(method: string, input?: Record<string, unknown>): Prom
 }
 
 // ─── OAuth popup login ────────────────────────────────────────────────────────
+//
+// Strategy depends on NVIDIA_REDIRECT_URI (reported by the server):
+//
+//   "server"  → redirect lands on our server (/api/auth/callback), which already
+//               posts auth_success/auth_error to window.opener.  Classic flow.
+//
+//   "client"  → redirect goes somewhere we can't receive server-side
+//               (custom scheme like nvapp://, localhost loopback, or our relay page).
+//               We use TWO interception methods in parallel:
+//
+//               A) postMessage listener  – catches relays from /auth/relay (same-origin)
+//                  or from NVIDIA pages that post messages directly.
+//
+//               B) location polling      – every 150 ms we try to read popup.location.href.
+//                  While the popup is cross-origin (nvidia.com) this throws SecurityError,
+//                  which we swallow.  Once NVIDIA redirects to:
+//                    • a same-origin URL  (/auth/relay)  → we read it directly
+//                    • a custom scheme    (nvapp://)     → Chrome/Firefox may keep the
+//                      popup on the previous page OR navigate to the scheme.  In either
+//                      case the location read throws, but if the popup navigates to
+//                      about:blank after a failed scheme launch we can catch that too.
+//                  For custom-scheme redirects the relay page method is more reliable;
+//                  use location polling as a belt-and-suspenders fallback.
+
+interface AuthorizeUrlResponse {
+  url: string;
+  state: string;
+  redirectUri: string;
+  interceptMode: "server" | "client";
+}
+
+function extractCodeFromUrl(href: string): { code: string; state: string } | null {
+  try {
+    const u = new URL(href);
+    const code = u.searchParams.get("code");
+    const state = u.searchParams.get("state");
+    if (code && state) return { code, state };
+  } catch {
+    // custom-scheme URLs may not parse with the URL constructor; try manual parsing
+    const codeMatch = href.match(/[?&]code=([^&]+)/);
+    const stateMatch = href.match(/[?&]state=([^&]+)/);
+    if (codeMatch && stateMatch) {
+      return { code: decodeURIComponent(codeMatch[1]), state: decodeURIComponent(stateMatch[1]) };
+    }
+  }
+  return null;
+}
+
+async function exchangeCode(code: string, state: string): Promise<void> {
+  await apiFetch<{ ok: boolean }>("/api/auth/exchange", {
+    method: "POST",
+    body: JSON.stringify({ code, state }),
+  });
+}
 
 function openLoginPopup(provider: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const url = `/api/auth/login?provider=${encodeURIComponent(provider)}`;
-    const popup = window.open(url, "nvidia_login", "width=520,height=680,menubar=no,toolbar=no");
-    if (!popup) {
-      reject(new Error("Could not open login popup – please allow popups for this site."));
-      return;
-    }
-    const timer = setInterval(() => {
-      if (popup.closed) {
-        clearInterval(timer);
-        reject(new Error("Login window closed before completing sign-in."));
-      }
-    }, 500);
+    // Step 1 – ask the server for PKCE params + the authorise URL.
+    // The server stores state + code_verifier in the session.
+    apiFetch<AuthorizeUrlResponse>(`/api/auth/authorize-url?provider=${encodeURIComponent(provider)}`)
+      .then(({ url, interceptMode }) => {
+        const popup = window.open(url, "nvidia_login", "width=520,height=680,menubar=no,toolbar=no,location=no");
+        if (!popup) {
+          reject(new Error("Could not open login popup – please allow popups for this site."));
+          return;
+        }
 
-    const handleMessage = (event: MessageEvent) => {
-      if (typeof event.data !== "object" || event.data === null) return;
-      const { type, error } = event.data as { type: string; error?: string };
-      if (type === "auth_success") {
-        clearInterval(timer);
-        window.removeEventListener("message", handleMessage);
-        popup.close();
-        resolve();
-      } else if (type === "auth_error") {
-        clearInterval(timer);
-        window.removeEventListener("message", handleMessage);
-        popup.close();
-        reject(new Error(error ?? "Authentication failed"));
-      }
-    };
-    window.addEventListener("message", handleMessage);
+        let settled = false;
+
+        function settle(err?: Error) {
+          if (settled) return;
+          settled = true;
+          clearInterval(locationPoll);
+          clearInterval(closedPoll);
+          window.removeEventListener("message", onMessage);
+          if (err) {
+            try { popup.close(); } catch { /* ignore */ }
+            reject(err);
+          } else {
+            try { popup.close(); } catch { /* ignore */ }
+            resolve();
+          }
+        }
+
+        // ── A) postMessage listener ──────────────────────────────────────────
+        // Handles two sources:
+        //   • /auth/relay page (sends auth_code)
+        //   • server-side /api/auth/callback page (sends auth_success / auth_error)
+        const onMessage = async (event: MessageEvent) => {
+          if (typeof event.data !== "object" || event.data === null) return;
+          const msg = event.data as Record<string, unknown>;
+
+          if (msg.type === "auth_success") {
+            // Server already completed token exchange (server-intercept mode)
+            settle();
+          } else if (msg.type === "auth_error") {
+            settle(new Error((msg.error as string) ?? "Authentication failed"));
+          } else if (msg.type === "auth_code") {
+            // Relay page handed us the raw code – exchange it now
+            const { code, state } = msg as { code: string; state: string };
+            try {
+              await exchangeCode(code, state);
+              settle();
+            } catch (e) {
+              settle(e instanceof Error ? e : new Error(String(e)));
+            }
+          }
+        };
+        window.addEventListener("message", onMessage);
+
+        if (interceptMode === "server") {
+          // Server-intercept mode: the callback page posts auth_success/error.
+          // Location polling is unnecessary; just watch for the popup closing.
+        }
+
+        // ── B) location polling (client-intercept / custom-scheme mode) ──────
+        // Tries to read popup.location.href every 150 ms.
+        // - Cross-origin pages (nvidia.com) → throws SecurityError, we ignore.
+        // - Same-origin redirect (/auth/relay) → relay script runs and posts
+        //   auth_code back, but we also catch it here for redundancy.
+        // - Custom scheme (nvapp://) → after failed navigation the popup may
+        //   end up at about:blank which IS readable; we check for the code there.
+        //   On some browsers the href briefly becomes the scheme URI before the
+        //   browser blocks it – extractCodeFromUrl handles that case.
+        const locationPoll = setInterval(async () => {
+          if (settled) return;
+          try {
+            const href = popup.location.href;
+            if (!href || href === "about:blank") return;
+
+            const extracted = extractCodeFromUrl(href);
+            if (extracted) {
+              clearInterval(locationPoll);
+              try {
+                await exchangeCode(extracted.code, extracted.state);
+                settle();
+              } catch (e) {
+                settle(e instanceof Error ? e : new Error(String(e)));
+              }
+            }
+          } catch {
+            // SecurityError expected while popup is on nvidia.com — keep polling
+          }
+        }, 150);
+
+        // ── C) closed-without-auth guard ─────────────────────────────────────
+        const closedPoll = setInterval(() => {
+          if (settled) return;
+          if (popup.closed) {
+            settle(new Error("Login window closed before completing sign-in."));
+          }
+        }, 500);
+      })
+      .catch((err) => {
+        reject(new Error(`Failed to start login: ${err instanceof Error ? err.message : String(err)}`));
+      });
   });
 }
 

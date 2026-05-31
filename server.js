@@ -11,8 +11,15 @@
  *
  * Environment variables
  * ─────────────────────
- * NVIDIA_CLIENT_ID      – OAuth client ID registered with NVIDIA
+ * NVIDIA_CLIENT_ID      – OAuth client ID (from desktop app bundle or your own registration)
  * NVIDIA_CLIENT_SECRET  – OAuth client secret (leave blank for public PKCE apps)
+ * NVIDIA_REDIRECT_URI   – Override the redirect URI used in the OAuth flow.
+ *                          • Leave unset  → uses <APP_BASE_URL>/api/auth/callback  (server-side callback)
+ *                          • Custom scheme → e.g. nvapp://auth/callback             (desktop-app trick: popup polling)
+ *                          • Relay page   → e.g. <APP_BASE_URL>/auth/relay         (popup postMessage relay)
+ *                         The desktop-app trick lets you reuse embedded client credentials without
+ *                         registering a web redirect URI: the popup intercepts the scheme redirect
+ *                         client-side and hands the code to the server for token exchange.
  * APP_BASE_URL          – Public URL of this deployment (e.g. https://my-app.koyeb.app)
  * SESSION_SECRET        – Random secret for signing session cookies (generate one!)
  * PORT                  – Listen port (default 8080)
@@ -35,7 +42,31 @@ const DIST_DIR = path.join(__dirname, "dist");
 const NVIDIA_CLIENT_ID = process.env.NVIDIA_CLIENT_ID ?? "";
 const NVIDIA_CLIENT_SECRET = process.env.NVIDIA_CLIENT_SECRET ?? "";
 const APP_BASE_URL = (process.env.APP_BASE_URL ?? "").replace(/\/$/, "");
-const REDIRECT_URI = `${APP_BASE_URL}/api/auth/callback`;
+
+// NVIDIA_REDIRECT_URI controls which OAuth mode is used:
+//   unset / empty  → server-side callback at <APP_BASE_URL>/api/auth/callback  (current behaviour)
+//   custom scheme  → e.g. "nvapp://auth/callback" — popup polls location for the redirect
+//   relay page     → e.g. "<APP_BASE_URL>/auth/relay" — popup postMessages code back to opener
+const NVIDIA_REDIRECT_URI = (process.env.NVIDIA_REDIRECT_URI ?? "").trim();
+const REDIRECT_URI = NVIDIA_REDIRECT_URI || `${APP_BASE_URL}/api/auth/callback`;
+
+// A redirect URI is "client-intercepted" when it cannot land on our server
+// (custom schemes, localhost loopback, or the explicit relay page path).
+// In those cases the popup itself hands us the auth code via postMessage or
+// location polling; the server just needs to finish the token exchange.
+function isClientInterceptedRedirectUri(uri) {
+  if (!uri) return false;
+  if (/^[a-z][a-z0-9+\-.]*:\/\//i.test(uri) && !uri.startsWith("https://") && !uri.startsWith("http://")) {
+    return true; // custom scheme  e.g. nvapp://
+  }
+  if (/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//i.test(uri)) {
+    return true; // loopback
+  }
+  if (uri.includes("/auth/relay")) {
+    return true; // explicit relay page
+  }
+  return false;
+}
 
 const NVIDIA_AUTH_URL = "https://login.nvgs.nvidia.com/v1/authorize";
 const NVIDIA_TOKEN_URL = "https://login.nvgs.nvidia.com/v1/token";
@@ -476,6 +507,185 @@ app.post("/api/gfn/call", async (req, res) => {
   }
 });
 
+// ─── Client-intercepted OAuth endpoints ────────────────────────────────────
+// These support the "desktop-app trick": the popup opens NVIDIA's auth page
+// directly (no server redirect), intercepts the redirect client-side, then
+// hands the code to the server for token exchange.
+//
+// This lets you reuse the NVIDIA desktop-app's embedded client_id + redirect URI
+// (e.g. a custom scheme like nvapp://) without registering a web callback URL.
+
+// GET /api/auth/authorize-url
+// Generates PKCE params + state (server-side so the verifier stays secret),
+// stores them in the session, and returns the full NVIDIA authorize URL.
+// The browser opens this URL directly in the popup.
+app.get("/api/auth/authorize-url", (req, res) => {
+  if (!NVIDIA_CLIENT_ID) {
+    return res.status(503).json({ error: "NVIDIA_CLIENT_ID not configured" });
+  }
+
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = generateCodeChallenge(codeVerifier);
+  const state = crypto.randomBytes(16).toString("hex");
+
+  req.session.oauthState = state;
+  req.session.oauthCodeVerifier = codeVerifier;
+  req.session.oauthProvider = req.query.provider ?? "nvidia";
+
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: NVIDIA_CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    scope: NVIDIA_OAUTH_SCOPES,
+    state,
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
+  });
+
+  res.json({
+    url: `${NVIDIA_AUTH_URL}?${params}`,
+    state,
+    redirectUri: REDIRECT_URI,
+    // tells the client which interception strategy to use
+    interceptMode: isClientInterceptedRedirectUri(REDIRECT_URI) ? "client" : "server",
+  });
+});
+
+// POST /api/auth/exchange
+// The popup has intercepted the auth code (via location polling or postMessage)
+// and hands it to us for server-side token exchange.  The PKCE code_verifier
+// is already in the session from the /authorize-url call above.
+app.post("/api/auth/exchange", async (req, res) => {
+  const { code, state } = req.body ?? {};
+
+  if (!code) return res.status(400).json({ error: "code required" });
+  if (!state || state !== req.session.oauthState) {
+    return res.status(400).json({ error: "State mismatch – possible CSRF. Please try logging in again." });
+  }
+
+  const codeVerifier = req.session.oauthCodeVerifier;
+  if (!codeVerifier) {
+    return res.status(400).json({ error: "No PKCE verifier found in session. Did /authorize-url expire?" });
+  }
+
+  try {
+    const tokenBody = new URLSearchParams({
+      grant_type: "authorization_code",
+      code: String(code),
+      redirect_uri: REDIRECT_URI,
+      client_id: NVIDIA_CLIENT_ID,
+      code_verifier: codeVerifier,
+      ...(NVIDIA_CLIENT_SECRET ? { client_secret: NVIDIA_CLIENT_SECRET } : {}),
+    });
+
+    const tokenRes = await fetch(NVIDIA_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: tokenBody,
+    });
+
+    if (!tokenRes.ok) {
+      const err = await tokenRes.text();
+      throw new Error(`Token exchange failed (${tokenRes.status}): ${err.slice(0, 200)}`);
+    }
+
+    const tokenData = await tokenRes.json();
+    const now = Math.floor(Date.now() / 1000);
+    const tokens = {
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token ?? null,
+      idToken: tokenData.id_token ?? null,
+      expiresAt: now + (tokenData.expires_in ?? 3600),
+    };
+
+    const userInfo = await gfnFetch(NVIDIA_USERINFO_URL, tokens.accessToken);
+
+    req.session.authSession = {
+      provider: {
+        idpId: "nvidia",
+        code: "NVIDIA",
+        displayName: "NVIDIA",
+        streamingServiceUrl: GFN_STREAMING_BASE_URL,
+        priority: 0,
+      },
+      tokens,
+      user: {
+        userId: userInfo.sub ?? userInfo.userId ?? "unknown",
+        displayName: userInfo.name ?? userInfo.displayName ?? userInfo.email ?? "NVIDIA User",
+        email: userInfo.email,
+        membershipTier: userInfo.membershipTier ?? "unknown",
+      },
+    };
+
+    delete req.session.oauthState;
+    delete req.session.oauthCodeVerifier;
+    delete req.session.oauthProvider;
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[auth] /api/auth/exchange error:", err);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// GET /auth/relay  (also /auth/relay.html for legacy links)
+// A tiny standalone page served as the OAuth redirect URI when using the
+// relay-page strategy.  NVIDIA lands here with ?code=...&state=..., this page
+// immediately postMessages the code back to window.opener, then closes itself.
+// No tokens are ever stored or logged here — it's just a message bus.
+const RELAY_HTML = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Completing sign-in…</title>
+  <style>
+    body { display:flex; align-items:center; justify-content:center;
+           height:100vh; margin:0; background:#0a0a0a; color:#e5e5e5;
+           font-family:system-ui,sans-serif; font-size:14px; }
+    .msg { text-align:center; opacity:.7; }
+    .dot { display:inline-block; animation: blink 1s step-start infinite; }
+    @keyframes blink { 50% { opacity:0; } }
+  </style>
+</head>
+<body>
+  <div class="msg">Completing sign-in<span class="dot">…</span></div>
+  <script>
+    (function () {
+      var params = new URLSearchParams(window.location.search);
+      var code  = params.get('code');
+      var state = params.get('state');
+      var error = params.get('error');
+      var target = window.opener || (window.parent !== window ? window.parent : null);
+
+      function send(msg) {
+        if (target) {
+          // Try same-origin first; fall back to '*' so this works during local dev
+          try { target.postMessage(msg, window.location.origin); } catch (_) {}
+          try { target.postMessage(msg, '*'); } catch (_) {}
+        }
+        // Small delay so the message has time to be received before the window closes
+        setTimeout(function () { window.close(); }, 800);
+      }
+
+      if (error) {
+        send({ type: 'auth_error', error: decodeURIComponent(error) });
+      } else if (code && state) {
+        send({ type: 'auth_code', code: code, state: state });
+      } else {
+        send({ type: 'auth_error', error: 'No code or error in redirect URL' });
+      }
+    })();
+  </script>
+</body>
+</html>`;
+
+app.get(["/auth/relay", "/auth/relay.html"], (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  // Must not be cached — each login attempt gets a fresh relay
+  res.setHeader("Cache-Control", "no-store");
+  res.send(RELAY_HTML);
+});
+
 // ─── Serve frontend ────────────────────────────────────────────────────────
 app.use(express.static(DIST_DIR));
 // SPA fallback – all non-API routes serve index.html
@@ -488,7 +698,11 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`[opennow-web] Listening on http://0.0.0.0:${PORT}`);
   if (!NVIDIA_CLIENT_ID) {
     console.warn("[opennow-web] ⚠️  NVIDIA_CLIENT_ID is not set — login will not work.");
-    console.warn("[opennow-web]    Set NVIDIA_CLIENT_ID, NVIDIA_CLIENT_SECRET, and APP_BASE_URL env vars.");
+    console.warn("[opennow-web]    Set NVIDIA_CLIENT_ID (extracted from the desktop app bundle or your own NVIDIA dev registration).");
+    console.warn("[opennow-web]    Optionally set NVIDIA_REDIRECT_URI to use the desktop-app trick (e.g. nvapp://auth/callback).");
+  } else {
+    const mode = isClientInterceptedRedirectUri(REDIRECT_URI) ? "client-intercepted popup" : "server-side callback";
+    console.log(`[opennow-web] OAuth mode: ${mode} — redirect URI: ${REDIRECT_URI}`);
   }
   if (!process.env.SESSION_SECRET) {
     console.warn("[opennow-web] ⚠️  SESSION_SECRET is not set — using insecure default. Set it in production!");
