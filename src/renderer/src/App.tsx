@@ -206,6 +206,8 @@ export function App(): JSX.Element {
   const [providerIdpId, setProviderIdpId] = useState("");
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [urlPasteModal, setUrlPasteModal] = useState<{ resolve: (url: string | null) => void } | null>(null);
+  const [urlPasteValue, setUrlPasteValue] = useState("");
   const [isInitializing, setIsInitializing] = useState(true);
   const [startupStatusMessage, setStartupStatusMessage] = useState(() => t("auth.status.restoringSavedSession"));
   const [startupRefreshNotice, setStartupRefreshNotice] = useState<{
@@ -1514,6 +1516,18 @@ export function App(): JSX.Element {
 
     void initialize();
   }, [loadSessionRuntimeData, resetStorePanels, t]);
+
+  // Manual OAuth URL paste modal — web-shim fires "opennow:auth:needs-url" when it
+  // can't intercept the redirect automatically (e.g. localhost:2259 on remote deploy).
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { resolve } = (e as CustomEvent<{ resolve: (url: string | null) => void }>).detail;
+      setUrlPasteValue("");
+      setUrlPasteModal({ resolve });
+    };
+    window.addEventListener("opennow:auth:needs-url", handler);
+    return () => window.removeEventListener("opennow:auth:needs-url", handler);
+  }, []);
 
   // Login handler
   const handleLogin = useCallback(async () => {
@@ -2953,6 +2967,77 @@ export function App(): JSX.Element {
     savedAccounts.find((account) => account.userId === accountToRemove)?.displayName ?? t("auth.accounts.thisAccount")
   ), [accountToRemove, savedAccounts, locale, t]);
 
+  const urlPasteModalPortal = urlPasteModal && typeof document !== "undefined"
+    ? createPortal(
+        <div className="logout-confirm" role="dialog" aria-modal="true" aria-label="Complete sign-in">
+          <button
+            type="button"
+            className="logout-confirm-backdrop"
+            onClick={() => { urlPasteModal.resolve(null); setUrlPasteModal(null); }}
+            aria-label="Cancel"
+          />
+          <div className="logout-confirm-card">
+            <div className="logout-confirm-kicker">Action required</div>
+            <h3 className="logout-confirm-title">Paste the redirect URL</h3>
+            <p className="logout-confirm-text">
+              After signing in, the popup lands on a <code>localhost:2259</code> URL that
+              this browser can&apos;t read automatically. Copy the full URL from the
+              popup&apos;s address bar and paste it below.
+            </p>
+            <p className="logout-confirm-subtext">
+              It looks like: <code style={{wordBreak:"break-all", fontSize:"0.78em"}}>http://localhost:2259/?state=…&amp;code=…</code>
+            </p>
+            <input
+              type="text"
+              value={urlPasteValue}
+              onChange={(e) => setUrlPasteValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && urlPasteValue.trim()) {
+                  urlPasteModal.resolve(urlPasteValue.trim());
+                  setUrlPasteModal(null);
+                } else if (e.key === "Escape") {
+                  urlPasteModal.resolve(null);
+                  setUrlPasteModal(null);
+                }
+              }}
+              placeholder="http://localhost:2259/?state=…&code=…"
+              autoFocus
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                padding: "8px 10px",
+                marginBottom: "16px",
+                borderRadius: "6px",
+                border: "1px solid rgba(255,255,255,0.15)",
+                background: "rgba(255,255,255,0.06)",
+                color: "inherit",
+                fontSize: "0.82em",
+                fontFamily: "monospace",
+              }}
+            />
+            <div className="logout-confirm-actions">
+              <button
+                type="button"
+                className="logout-confirm-btn logout-confirm-btn-cancel"
+                onClick={() => { urlPasteModal.resolve(null); setUrlPasteModal(null); }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="logout-confirm-btn logout-confirm-btn-confirm"
+                disabled={!urlPasteValue.trim()}
+                onClick={() => { urlPasteModal.resolve(urlPasteValue.trim()); setUrlPasteModal(null); }}
+              >
+                Complete sign-in
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )
+    : null;
+
   const logoutConfirmModal = logoutConfirmOpen && typeof document !== "undefined"
     ? createPortal(
         <div className="logout-confirm" role="dialog" aria-modal="true" aria-label={t("auth.accounts.logOutConfirmation")}>
@@ -3650,6 +3735,7 @@ export function App(): JSX.Element {
           />
         )}
       </main>
+      {urlPasteModalPortal}
       {logoutConfirmModal}
       {removeAccountConfirmModal}
       {queueModalGame && streamStatus === "idle" && (

@@ -499,6 +499,7 @@ app.get("/api/auth/accounts", (req, res) => {
 // Allowed GFN API domains (allowlist to prevent SSRF)
 const GFN_ALLOWED_HOSTS = [
   "login.nvidia.com",           // auth endpoints (login.nvidia.com/authorize|token|userinfo)
+  "accounts.nvgs.nvidia.com",   // NVGS internal OAuth cluster (seen in proxy redirect chain)
   "pcs.geforcenow.com",         // service URLs / provider discovery
   "api.prod.nvidia.com",
   "api.nvidiagfn.com",
@@ -820,6 +821,53 @@ app.use(express.static(DIST_DIR));
 app.get(/^(?!\/api\/).*$/, (_req, res) => {
   res.sendFile(path.join(DIST_DIR, "index.html"));
 });
+
+// ─── Auxiliary localhost OAuth listener ─────────────────────────────────────
+// When NVIDIA_REDIRECT_URI is a loopback URL (e.g. http://localhost:2259),
+// NVIDIA will redirect the popup browser to that port on the USER's machine.
+// For LOCAL deployments (where this server IS on the user's machine) we start
+// a tiny auxiliary HTTP listener on that port to receive the callback and
+// forward the code back to our main server's /api/auth/callback handler.
+//
+// This does NOT help for remote deployments (e.g. Koyeb) because localhost:PORT
+// on the user's browser points to their own machine, not the Koyeb server.
+// For remote deployments, use a custom-scheme redirect URI (NVIDIA_REDIRECT_URI=geforcenow://open)
+// instead, and the client-side popup trick handles the code interception.
+(function startLocalhostAuxListener() {
+  if (!REDIRECT_URI) return;
+  let loopbackMatch;
+  try {
+    const u = new URL(REDIRECT_URI);
+    const isLoopback = u.hostname === "localhost" || u.hostname === "127.0.0.1";
+    if (!isLoopback) return;
+    const auxPort = parseInt(u.port || "80", 10);
+    if (isNaN(auxPort) || auxPort === PORT) return; // same port as main server — no-op
+    loopbackMatch = { port: auxPort, path: u.pathname };
+  } catch {
+    return;
+  }
+
+  const aux = express();
+  aux.get(loopbackMatch.path || "/", (req, res) => {
+    const { code, state, error } = req.query;
+    if (error) {
+      // Redirect to our main server's callback so it can render the error page
+      return res.redirect(`${APP_BASE_URL}/api/auth/callback?error=${encodeURIComponent(error)}`);
+    }
+    if (code && state) {
+      return res.redirect(
+        `${APP_BASE_URL}/api/auth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`
+      );
+    }
+    res.status(400).send("Missing code or state in OAuth callback");
+  });
+  aux.listen(loopbackMatch.port, "127.0.0.1", () => {
+    console.log(`[opennow-web] Aux OAuth listener → http://127.0.0.1:${loopbackMatch.port} (forwarding to ${APP_BASE_URL}/api/auth/callback)`);
+  }).on("error", (err) => {
+    console.warn(`[opennow-web] ⚠️  Could not start aux OAuth listener on port ${loopbackMatch.port}: ${err.message}`);
+    console.warn(`[opennow-web]    If nothing else is using that port, the server-side callback won't work for local deployments.`);
+  });
+})();
 
 // ─── Start ─────────────────────────────────────────────────────────────────
 app.listen(PORT, "0.0.0.0", () => {

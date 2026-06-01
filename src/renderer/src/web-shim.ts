@@ -49,22 +49,33 @@ async function gfnCall<T>(method: string, input?: Record<string, unknown>): Prom
 //               posts auth_success/auth_error to window.opener.  Classic flow.
 //
 //   "client"  → redirect goes somewhere we can't receive server-side
-//               (custom scheme like nvapp://, localhost loopback, or our relay page).
-//               We use TWO interception methods in parallel:
+//               (custom scheme like geforcenow://, localhost loopback, or our relay page).
+//               We use THREE interception methods in priority order:
 //
 //               A) postMessage listener  – catches relays from /auth/relay (same-origin)
-//                  or from NVIDIA pages that post messages directly.
+//                  or from server /api/auth/callback page (auth_success / auth_error).
 //
-//               B) location polling      – every 150 ms we try to read popup.location.href.
-//                  While the popup is cross-origin (nvidia.com) this throws SecurityError,
-//                  which we swallow.  Once NVIDIA redirects to:
-//                    • a same-origin URL  (/auth/relay)  → we read it directly
-//                    • a custom scheme    (nvapp://)     → Chrome/Firefox may keep the
-//                      popup on the previous page OR navigate to the scheme.  In either
-//                      case the location read throws, but if the popup navigates to
-//                      about:blank after a failed scheme launch we can catch that too.
-//                  For custom-scheme redirects the relay page method is more reliable;
-//                  use location polling as a belt-and-suspenders fallback.
+//               B) location polling      – every 100 ms we try to read popup.location.href.
+//                  While the popup is cross-origin (nvidia.com) this throws SecurityError.
+//                  Once NVIDIA redirects to a same-origin URL (/auth/relay) we can read it.
+//
+//                  For custom schemes (geforcenow://open):
+//                  • Chrome: navigates popup to ERR_UNKNOWN_URL_SCHEME at the scheme URL
+//                    (cross-origin — SecurityError). If GFN IS installed, OS handles the
+//                    scheme → GFN app opens → popup navigates to about:blank (same-origin,
+//                    readable). document.referrer on that about:blank is usually empty or
+//                    the NVIDIA page, NOT the scheme URL, so we can't recover the code that
+//                    way. The code has gone to the GFN app, not us.
+//                  • Firefox: shows a protocol dialog. If dismissed, popup stays on NVIDIA
+//                    page (SecurityError). If accepted and no app, shows error page.
+//                  Neither path reliably gives us the code from the scheme URL.
+//
+//               C) manual URL fallback  – when the popup closes (or times out) without a
+//                  successful auth, and we're in client-intercept mode, we show the user
+//                  a prompt asking them to paste the redirect URL from the popup's address
+//                  bar (e.g. "geforcenow://open?code=abc123&state=xyz"). This is the
+//                  guaranteed fallback: the URL is ALWAYS visible in the popup/app, and
+//                  extractCodeFromUrl handles non-standard custom scheme URLs via regex.
 
 interface AuthorizeUrlResponse {
   url: string;
@@ -103,17 +114,21 @@ function openLoginPopup(provider: string): Promise<void> {
     // The server stores state + code_verifier in the session.
     apiFetch<AuthorizeUrlResponse>(`/api/auth/authorize-url?provider=${encodeURIComponent(provider)}`)
       .then(({ url, interceptMode }) => {
-        const popup = window.open(url, "nvidia_login", "width=520,height=680,menubar=no,toolbar=no,location=no");
+        const popup = window.open(url, "nvidia_login", "width=520,height=720,menubar=no,toolbar=no");
         if (!popup) {
           reject(new Error("Could not open login popup – please allow popups for this site."));
           return;
         }
 
         let settled = false;
+        // manualFallbackTimer is declared below after interceptMode is known,
+        // but the reference is closed over here so settle() can clear it.
+        let manualFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
         function settle(err?: Error) {
           if (settled) return;
           settled = true;
+          if (manualFallbackTimer !== null) { clearTimeout(manualFallbackTimer); manualFallbackTimer = null; }
           clearInterval(locationPoll);
           clearInterval(closedPoll);
           window.removeEventListener("message", onMessage);
@@ -152,55 +167,20 @@ function openLoginPopup(provider: string): Promise<void> {
         };
         window.addEventListener("message", onMessage);
 
-        if (interceptMode === "server") {
-          // Server-intercept mode: the callback page posts auth_success/error.
-          // Location polling is unnecessary; just watch for the popup closing.
-        }
-
-        // ── B) location polling (client-intercept / custom-scheme mode) ──────
-        // Tries to read popup.location.href every 150 ms.
-        // - Cross-origin pages (nvidia.com) → throws SecurityError, we ignore.
-        // - Same-origin redirect (/auth/relay) → relay script runs and posts
-        //   auth_code back, but we also catch it here for redundancy.
-        // - Custom scheme (geforcenow://, nvapp://, etc.) → the browser cannot
-        //   navigate to a custom scheme, so it either:
-        //     a) briefly makes the href the scheme URL then goes to about:blank, or
-        //     b) stays on the last cross-origin page (throws SecurityError) then
-        //        goes to about:blank.
-        //   In case (b) the scheme URL is NEVER directly readable, so we must
-        //   check what caused the about:blank — store the last SecurityError
-        //   message, which some browsers include the target URL in.
-        //   More reliably: when we land on about:blank we check the document
-        //   referrer, which Chrome preserves as the scheme URL.
-        let lastReadableHref = "";
+        // ── B) location polling (client-intercept / relay-page mode) ─────────
+        // Reads popup.location.href every 100 ms.
+        // - Cross-origin pages (nvidia.com) → SecurityError, swallowed.
+        // - Same-origin relay page (/auth/relay) → relay posts auth_code via
+        //   postMessage (method A), but we also catch it here for redundancy.
+        // - Custom-scheme pages (geforcenow://...) → ERR_UNKNOWN_URL_SCHEME in
+        //   Chrome, which is cross-origin — SecurityError, unreadable. We cannot
+        //   extract the code this way. Method C (manual paste) is the fallback.
         const locationPoll = setInterval(async () => {
           if (settled) return;
           try {
             const href = popup.location.href;
-            if (!href) return;
-
-            if (href === "about:blank") {
-              // Browser navigated to about:blank after a failed custom-scheme redirect.
-              // Try reading document.referrer — Chrome preserves the scheme URL there.
-              let referrer = "";
-              try { referrer = popup.document.referrer; } catch { /* cross-origin */ }
-              const candidateUrl = referrer || lastReadableHref;
-              if (candidateUrl && candidateUrl !== "about:blank") {
-                const extracted = extractCodeFromUrl(candidateUrl);
-                if (extracted) {
-                  clearInterval(locationPoll);
-                  try {
-                    await exchangeCode(extracted.code, extracted.state);
-                    settle();
-                  } catch (e) {
-                    settle(e instanceof Error ? e : new Error(String(e)));
-                  }
-                }
-              }
-              return;
-            }
-
-            lastReadableHref = href;
+            if (!href || href === "about:blank") return;
+            // Same-origin hit (relay page or our own callback)
             const extracted = extractCodeFromUrl(href);
             if (extracted) {
               clearInterval(locationPoll);
@@ -212,17 +192,70 @@ function openLoginPopup(provider: string): Promise<void> {
               }
             }
           } catch {
-            // SecurityError expected while popup is on nvidia.com — keep polling
+            // SecurityError expected while popup is cross-origin — keep polling
           }
-        }, 150);
+        }, 100);
 
-        // ── C) closed-without-auth guard ─────────────────────────────────────
+        // ── C) manual URL fallback ────────────────────────────────────────────
+        // When NVIDIA redirects to a loopback URI (e.g. http://localhost:2259)
+        // on a remote deployment, the popup lands on an ERR_CONNECTION_REFUSED page
+        // that we can't read cross-origin.  We fire a CustomEvent so the React app
+        // can display a proper in-page modal asking the user to paste the URL.
+        // Falls back to window.prompt if no handler is registered (e.g. during tests).
+        const MANUAL_FALLBACK_DELAY_MS = 2_000;
+
+        async function tryManualFallback() {
+          if (settled) return;
+          // Check one more time if the popup closed cleanly
+          if (popup.closed) {
+            settle(new Error("Login window closed before completing sign-in."));
+            return;
+          }
+          const pasted = await new Promise<string | null>((resolveInput) => {
+            window.dispatchEvent(
+              new CustomEvent("opennow:auth:needs-url", { detail: { resolve: resolveInput } })
+            );
+          });
+          if (!pasted) {
+            settle(new Error("Login cancelled — no redirect URL was provided."));
+            return;
+          }
+          const extracted = extractCodeFromUrl(pasted.trim());
+          if (!extracted) {
+            settle(new Error(
+              "Couldn't find an auth code in the pasted URL.\n" +
+              "Make sure you copied the full URL including ?code=…&state=…",
+            ));
+            return;
+          }
+          try {
+            await exchangeCode(extracted.code, extracted.state);
+            settle();
+          } catch (e) {
+            settle(e instanceof Error ? e : new Error(String(e)));
+          }
+        }
+
+        if (interceptMode === "client") {
+          manualFallbackTimer = setTimeout(tryManualFallback, MANUAL_FALLBACK_DELAY_MS);
+        }
+
+        // ── D) closed-without-auth guard ──────────────────────────────────────
         const closedPoll = setInterval(() => {
           if (settled) return;
           if (popup.closed) {
-            settle(new Error("Login window closed before completing sign-in."));
+            if (interceptMode === "client" && manualFallbackTimer !== null) {
+              // Popup closed while we're still waiting — trigger manual fallback
+              // immediately rather than waiting for the timer (scheme may have
+              // been handled by an installed app, leaving the URL in a browser bar).
+              clearTimeout(manualFallbackTimer);
+              manualFallbackTimer = null;
+              void tryManualFallback();
+            } else {
+              settle(new Error("Login window closed before completing sign-in."));
+            }
           }
-        }, 500);
+        }, 300);
       })
       .catch((err) => {
         reject(new Error(`Failed to start login: ${err instanceof Error ? err.message : String(err)}`));
