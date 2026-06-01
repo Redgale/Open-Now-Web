@@ -41,6 +41,46 @@ async function gfnCall<T>(method: string, input?: Record<string, unknown>): Prom
   });
 }
 
+// ─── Direct GFN calls (client-side mode) ─────────────────────────────────────
+// When the server sets GFN_CLIENT_SIDE_CALLS=true, GFN API requests are made
+// directly from the browser using the token from /api/auth/gfn-token.
+// This bypasses the BFF proxy and avoids NVIDIA blocking datacenter IPs.
+
+interface GfnTokenResponse { accessToken: string; streamingBaseUrl: string; }
+let _directGfnToken: GfnTokenResponse | null = null;
+
+async function getDirectGfnToken(): Promise<GfnTokenResponse | null> {
+  if (_directGfnToken) return _directGfnToken;
+  try {
+    const res = await fetch("/api/auth/gfn-token");
+    if (!res.ok) return null;
+    _directGfnToken = await res.json() as GfnTokenResponse;
+    return _directGfnToken;
+  } catch {
+    return null;
+  }
+}
+
+const GFN_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 GFNClient/2.0";
+
+async function directGfnFetch<T>(urlPath: string, baseUrl?: string): Promise<T> {
+  const creds = await getDirectGfnToken();
+  if (!creds) throw new Error("No direct GFN token available");
+  const url = `${(baseUrl ?? creds.streamingBaseUrl).replace(/\/$/, "")}${urlPath}`;
+  const res = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${creds.accessToken}`,
+      "User-Agent": GFN_USER_AGENT,
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`GFN direct ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res.json() as Promise<T>;
+}
+
 // ─── OAuth popup login ────────────────────────────────────────────────────────
 //
 // Strategy depends on NVIDIA_REDIRECT_URI (reported by the server):
@@ -450,8 +490,10 @@ const openNowShim: OpenNowApi = {
     try {
       return await gfnCall("getRegions", input as any ?? {});
     } catch (e) {
-      console.warn("[shim] getRegions failed:", e);
-      return [];
+      console.warn("[shim] getRegions BFF failed, trying direct:", e);
+      try { return await directGfnFetch<any[]>("/zones"); } catch (e2) {
+        console.warn("[shim] getRegions direct failed:", e2); return [];
+      }
     }
   },
 
@@ -459,12 +501,11 @@ const openNowShim: OpenNowApi = {
     try {
       return await gfnCall("fetchSubscription", input as any);
     } catch (e) {
-      console.warn("[shim] fetchSubscription failed:", e);
-      return {
-        membershipTier: "unknown", allottedHours: 0, purchasedHours: 0,
-        rolledOverHours: 0, usedHours: 0, remainingHours: 0, totalHours: 0,
-        isUnlimited: false, entitledResolutions: [],
-      };
+      console.warn("[shim] fetchSubscription BFF failed, trying direct:", e);
+      try { return await directGfnFetch<any>("/users/v1/me/subscription"); } catch (e2) {
+        console.warn("[shim] fetchSubscription direct failed:", e2);
+        return { membershipTier: "unknown", allottedHours: 0, purchasedHours: 0, rolledOverHours: 0, usedHours: 0, remainingHours: 0, totalHours: 0, isUnlimited: false, entitledResolutions: [] };
+      }
     }
   },
 
@@ -473,8 +514,11 @@ const openNowShim: OpenNowApi = {
       const data: any = await gfnCall("fetchMainGames", input as any);
       return Array.isArray(data) ? data : (data.apps ?? data.games ?? data.results ?? []);
     } catch (e) {
-      console.warn("[shim] fetchMainGames failed:", e);
-      return [];
+      console.warn("[shim] fetchMainGames BFF failed, trying direct:", e);
+      try {
+        const data: any = await directGfnFetch<any>("/apps/v1/apps?limit=2000&sortBy=displayName");
+        return Array.isArray(data) ? data : (data.apps ?? data.games ?? data.results ?? []);
+      } catch (e2) { console.warn("[shim] fetchMainGames direct failed:", e2); return []; }
     }
   },
 
@@ -483,8 +527,11 @@ const openNowShim: OpenNowApi = {
       const data: any = await gfnCall("fetchStorePanels", input as any);
       return Array.isArray(data) ? data : (data.panels ?? []);
     } catch (e) {
-      console.warn("[shim] fetchStorePanels failed:", e);
-      return { panels: [], total: 0 };
+      console.warn("[shim] fetchStorePanels BFF failed, trying direct:", e);
+      try {
+        const data: any = await directGfnFetch<any>("/apps/v1/panels");
+        return Array.isArray(data) ? data : (data.panels ?? []);
+      } catch (e2) { console.warn("[shim] fetchStorePanels direct failed:", e2); return { panels: [], total: 0 }; }
     }
   },
 
@@ -493,8 +540,11 @@ const openNowShim: OpenNowApi = {
       const data: any = await gfnCall("fetchFeaturedGames", input as any);
       return Array.isArray(data) ? data : (data.apps ?? data.games ?? data.results ?? []);
     } catch (e) {
-      console.warn("[shim] fetchFeaturedGames failed:", e);
-      return [];
+      console.warn("[shim] fetchFeaturedGames BFF failed, trying direct:", e);
+      try {
+        const data: any = await directGfnFetch<any>("/apps/v1/apps?featured=true&limit=50");
+        return Array.isArray(data) ? data : (data.apps ?? data.games ?? data.results ?? []);
+      } catch (e2) { console.warn("[shim] fetchFeaturedGames direct failed:", e2); return []; }
     }
   },
 
@@ -503,25 +553,45 @@ const openNowShim: OpenNowApi = {
       const data: any = await gfnCall("fetchLibraryGames", input as any);
       return Array.isArray(data) ? data : (data.apps ?? data.games ?? data.results ?? []);
     } catch (e) {
-      console.warn("[shim] fetchLibraryGames failed:", e);
-      return [];
+      console.warn("[shim] fetchLibraryGames BFF failed, trying direct:", e);
+      try {
+        const data: any = await directGfnFetch<any>("/users/v1/me/library");
+        return Array.isArray(data) ? data : (data.apps ?? data.games ?? data.results ?? []);
+      } catch (e2) { console.warn("[shim] fetchLibraryGames direct failed:", e2); return []; }
     }
   },
 
   async browseCatalog(input) {
-    try {
-      const data: any = await gfnCall("browseCatalog", input as any);
-      if (Array.isArray(data)) return { results: data, total: data.length };
+    const params = new URLSearchParams({ limit: String((input as any)?.fetchCount ?? 200) });
+    if ((input as any)?.searchQuery) params.set("searchQuery", (input as any).searchQuery);
+    if ((input as any)?.sortId) params.set("sortBy", (input as any).sortId);
+    if ((input as any)?.filterIds?.length) params.set("filterIds", (input as any).filterIds.join(","));
+    const path = `/apps/v1/apps?${params}`;
+    const normalize = (data: any): import("@shared/gfn").CatalogBrowseResult => {
+      const arr: any[] = Array.isArray(data) ? data : (data.apps ?? data.games ?? data.results ?? []);
       return {
-        results: data.apps ?? data.games ?? data.results ?? [],
-        total: data.total ?? data.totalCount ?? 0,
+        games: arr,
+        numberReturned: arr.length,
+        numberSupported: data.supportedCount ?? arr.length,
+        totalCount: data.total ?? data.totalCount ?? arr.length,
+        hasNextPage: false,
+        endCursor: undefined,
+        searchQuery: (input as any)?.searchQuery ?? "",
+        selectedSortId: (input as any)?.sortId ?? "",
+        selectedFilterIds: (input as any)?.filterIds ?? [],
         filterGroups: data.filterGroups ?? data.filters ?? [],
         sortOptions: data.sortOptions ?? data.sorts ?? [],
-        supportedCount: data.supportedCount,
       };
+    };
+    try {
+      const data: any = await gfnCall("browseCatalog", input as any);
+      return normalize(data);
     } catch (e) {
-      console.warn("[shim] browseCatalog failed:", e);
-      return { results: [], total: 0 };
+      console.warn("[shim] browseCatalog BFF failed, trying direct:", e);
+      try {
+        const data: any = await directGfnFetch<any>(path);
+        return normalize(data);
+      } catch (e2) { console.warn("[shim] browseCatalog direct failed:", e2); return normalize([]); }
     }
   },
 
