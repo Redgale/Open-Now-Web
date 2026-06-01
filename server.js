@@ -663,6 +663,24 @@ app.get("/api/auth/accounts", (req, res) => {
   ]);
 });
 
+// GET /api/auth/gfn-token
+// Returns the GFN access token + streaming base URL to the frontend so it can
+// make GFN API calls directly from the browser (bypassing the BFF proxy).
+// This is the fallback when Koyeb's server IPs are blocked by NVIDIA.
+// Only enabled when GFN_CLIENT_SIDE_CALLS=true env var is set.
+app.get("/api/auth/gfn-token", async (req, res) => {
+  if (process.env.GFN_CLIENT_SIDE_CALLS !== "true") {
+    return res.status(404).json({ error: "Not enabled (set GFN_CLIENT_SIDE_CALLS=true)" });
+  }
+  const token = await ensureValidToken(req).catch(() => null);
+  if (!token) return res.status(401).json({ error: "Not authenticated" });
+  const { authSession } = req.session ?? {};
+  res.json({
+    accessToken: token,
+    streamingBaseUrl: (authSession?.provider?.streamingServiceUrl ?? GFN_STREAMING_BASE_URL).replace(/\/$/, ""),
+  });
+});
+
 // ─── GFN API proxy routes ───────────────────────────────────────────────────
 // All GFN API calls from the web-shim come here so we can add auth headers
 // and avoid browser CORS restrictions.
@@ -1008,26 +1026,87 @@ body { display:flex; align-items:center; justify-content:center;
   });
 
   // ─── Diagnostics endpoint ──────────────────────────────────────────────────
-  // GET /api/debug/gfn-ping  — tests outbound connectivity to NVIDIA's GFN API.
-  // Useful for confirming that Koyeb's egress can actually reach NVIDIA servers.
-  // Remove or restrict in production once confirmed working.
-  app.get("/api/debug/gfn-ping", async (req, res) => {
-    const testUrl = `${GFN_STREAMING_BASE_URL}/identity/loginProviders`;
-    const start = Date.now();
+  // GET /api/debug/gfn-check  — full diagnostic: connectivity, auth, and a live
+  // GFN API call.  Visit this URL in the browser while logged in to see exactly
+  // what NVIDIA is returning.  Remove once the 502 issue is resolved.
+  app.get("/api/debug/gfn-check", async (req, res) => {
+    const results = {};
+
+    // 1. Raw connectivity — no auth, no special headers
+    const pingUrl = `${GFN_STREAMING_BASE_URL}/identity/loginProviders`;
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 10000);
-      const r = await fetch(testUrl, {
-        headers: { "User-Agent": GFN_USER_AGENT, Accept: "application/json" },
-        signal: ctrl.signal,
-      });
-      clearTimeout(timer);
-      const ct = r.headers.get("content-type") ?? "";
-      const body = ct.includes("application/json") ? await r.json().catch(() => "(json parse failed)") : await r.text().catch(() => "(body read failed)").then(t => t.slice(0, 200));
-      res.json({ ok: r.ok, status: r.status, contentType: ct, durationMs: Date.now() - start, body });
-    } catch (err) {
-      res.status(502).json({ ok: false, error: err.message, durationMs: Date.now() - start });
+      setTimeout(() => ctrl.abort(), 8000);
+      const t0 = Date.now();
+      const r = await fetch(pingUrl, { signal: ctrl.signal, headers: { Accept: "*/*" } });
+      const body = await r.text().catch(() => "");
+      results.connectivity = {
+        url: pingUrl, status: r.status,
+        contentType: r.headers.get("content-type"),
+        durationMs: Date.now() - t0,
+        bodySnippet: body.slice(0, 300),
+      };
+    } catch (e) {
+      results.connectivity = { url: pingUrl, error: e.message };
     }
+
+    // 2. Auth status from session / cookie
+    const token = await ensureValidToken(req).catch(e => { results.tokenError = e.message; return null; });
+    const { authSession } = req.session ?? {};
+    results.auth = {
+      hasToken: !!token,
+      tokenPrefix: token ? token.slice(0, 20) + "…" : null,
+      tokenSource: req.session?.authSession ? "session" : (authReadCookie(req) ? "cookie" : "none"),
+      streamingBaseUrl: authSession?.provider?.streamingServiceUrl ?? GFN_STREAMING_BASE_URL,
+      authBase: _AUTH_BASE,
+      expiresAt: authSession?.tokens?.expiresAt
+        ? new Date(authSession.tokens.expiresAt * 1000).toISOString()
+        : null,
+    };
+
+    // 3. Authenticated GFN call (getRegions — lightweight)
+    if (token) {
+      const baseUrl = (authSession?.provider?.streamingServiceUrl ?? GFN_STREAMING_BASE_URL).replace(/\/$/, "");
+      const testApiUrl = `${baseUrl}/zones`;
+      try {
+        const ctrl = new AbortController();
+        setTimeout(() => ctrl.abort(), 10000);
+        const t0 = Date.now();
+        const r = await fetch(testApiUrl, {
+          signal: ctrl.signal,
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": GFN_USER_AGENT,
+            Authorization: `Bearer ${token}`,
+            Referer: `${new URL(NVIDIA_AUTH_URL).origin}/`,
+            Origin: new URL(NVIDIA_AUTH_URL).origin,
+          },
+        });
+        const body = await r.text().catch(() => "");
+        results.authedCall = {
+          url: testApiUrl,
+          status: r.status,
+          contentType: r.headers.get("content-type"),
+          durationMs: Date.now() - t0,
+          bodySnippet: body.slice(0, 400),
+        };
+      } catch (e) {
+        results.authedCall = { url: testApiUrl, error: e.message };
+      }
+    } else {
+      results.authedCall = { skipped: "no token" };
+    }
+
+    // 4. Session cookie hygiene
+    results.session = {
+      trustProxy: app.get("trust proxy"),
+      secure: req.secure,
+      proto: req.get("x-forwarded-proto") ?? "(not set)",
+      sessionId: req.sessionID ? req.sessionID.slice(0, 8) + "…" : "(no session)",
+    };
+
+    res.json(results);
   });
 
   // ─── Global Express error handler ─────────────────────────────────────────
