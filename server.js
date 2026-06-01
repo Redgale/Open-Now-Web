@@ -300,21 +300,8 @@ function parseJwtPayload(token) {
 }
 
 // ─── GFN API proxy helper ───────────────────────────────────────────────────
-// When Koyeb's datacenter IPs are blocked by NVIDIA, set these two env vars to
-// route all GFN API calls through a Cloudflare Worker instead:
-//   CF_PROXY_URL    – your Worker URL, e.g. https://gfn-proxy.you.workers.dev
-//   CF_PROXY_SECRET – shared secret (must match PROXY_SECRET in the Worker)
-const CF_PROXY_URL    = (process.env.CF_PROXY_URL    ?? "").trim().replace(/\/$/, "");
-const CF_PROXY_SECRET = (process.env.CF_PROXY_SECRET ?? "").trim();
-
-if (CF_PROXY_URL) {
-  console.log(`[opennow-web] GFN egress → Cloudflare Worker proxy: ${CF_PROXY_URL}`);
-} else {
-  console.log("[opennow-web] GFN egress → direct (CF_PROXY_URL not set)");
-}
-
 async function gfnFetch(url, accessToken, options = {}) {
-  const gfnHeaders = {
+  const headers = {
     Accept: "application/json",
     "Content-Type": "application/json",
     "User-Agent": GFN_USER_AGENT,          // must match the real GFN client UA
@@ -328,26 +315,11 @@ async function gfnFetch(url, accessToken, options = {}) {
   const timeoutMs = parseInt(process.env.GFN_FETCH_TIMEOUT_MS ?? "15000", 10);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  // Route through Cloudflare Worker when configured, otherwise fetch directly.
-  // The Worker receives the real NVIDIA URL in x-target-url and strips the
-  // proxy-control headers before forwarding.
-  let fetchUrl     = url;
-  let fetchHeaders = gfnHeaders;
-  if (CF_PROXY_URL && CF_PROXY_SECRET) {
-    fetchUrl = CF_PROXY_URL;
-    fetchHeaders = {
-      ...gfnHeaders,
-      "x-target-url":   url,
-      "x-proxy-secret": CF_PROXY_SECRET,
-    };
-  }
-
   let res;
   try {
-    res = await fetch(fetchUrl, {
+    res = await fetch(url, {
       method: options.method ?? "GET",
-      headers: fetchHeaders,
+      headers,
       body: options.body ?? undefined,
       redirect: "follow",
       signal: controller.signal,
@@ -355,9 +327,8 @@ async function gfnFetch(url, accessToken, options = {}) {
   } catch (err) {
     clearTimeout(timer);
     const isTimeout = err.name === "AbortError";
-    const target    = CF_PROXY_URL ? `CF Worker → ${url}` : url;
     throw Object.assign(
-      new Error(isTimeout ? `GFN API request timed out after ${timeoutMs}ms for ${target}` : `GFN API network error for ${target}: ${err.message}`),
+      new Error(isTimeout ? `GFN API request timed out after ${timeoutMs}ms for ${url}` : `GFN API network error for ${url}: ${err.message}`),
       { status: isTimeout ? 504 : 502 }
     );
   }
@@ -369,7 +340,7 @@ async function gfnFetch(url, accessToken, options = {}) {
   if (ct.includes("text/html")) {
     throw Object.assign(
       new Error(`GFN API returned HTML login wall (token rejected or expired) for ${url}`),
-      { status: 401 }
+                        { status: 401 }
     );
   }
   if (!res.ok) {
