@@ -326,7 +326,16 @@ async function refreshAccessToken(refreshToken) {
 }
 
 async function ensureValidToken(req) {
-  if (!req.session?.authSession) return null;
+  // If the MemoryStore session was wiped (container restart), recover from the
+  // signed auth cookie.  This is the same fallback used by /api/auth/session,
+  // but proxy calls fire in parallel on page load and may arrive before the
+  // session endpoint has had a chance to restore + save the session.
+  if (!req.session?.authSession) {
+    const fromCookie = authReadCookie(req);
+    if (!fromCookie) return null;
+    console.log("[auth] ensureValidToken: restoring session from cookie");
+    req.session.authSession = fromCookie;
+  }
   const { tokens } = req.session.authSession;
   const now = Math.floor(Date.now() / 1000);
   // Refresh if within 5 minutes of expiry
