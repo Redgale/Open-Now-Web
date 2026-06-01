@@ -96,9 +96,15 @@ export function LoginScreen({
         const body = await res.json().catch(() => ({})) as { error?: string };
         throw new Error(body.error ?? `Server error ${res.status}`);
       }
-      // Exchange succeeded — close modal and let App.tsx reload the session
+      // Exchange succeeded. The server session now has the tokens.
+      // Do NOT call onLogin() here — that calls window.openNow.login() which
+      // calls openLoginPopup() which calls /api/auth/authorize-url and overwrites
+      // req.session.oauthState with a new value. If the paste modal is used again
+      // it then gets a "State mismatch" because the session state was just replaced.
+      // A page reload is the safe fix: App.tsx checks /api/auth/session on mount
+      // and finds the tokens the exchange just stored.
       setPasteModalOpen(false);
-      onLogin();
+      window.location.reload();
     } catch (e) {
       setPasteError(e instanceof Error ? e.message : "Exchange failed — try again.");
     } finally {
@@ -230,7 +236,7 @@ export function LoginScreen({
           <button
             type="button"
             onClick={() => setPasteModalOpen(true)}
-            disabled={isLoading || isInitializing}
+            disabled={false}
             style={{
               marginTop: "10px",
               width: "100%",
