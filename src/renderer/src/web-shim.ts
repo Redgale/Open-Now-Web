@@ -116,19 +116,21 @@ function openLoginPopup(provider: string): Promise<void> {
       .then(({ url, interceptMode }) => {
         const popup = window.open(url, "nvidia_login", "width=520,height=720,menubar=no,toolbar=no");
         if (!popup) {
-          reject(new Error("Could not open login popup – please allow popups for this site."));
+          reject(new Error("Could not open login popup \u2013 please allow popups for this site."));
           return;
         }
 
         let settled = false;
-        // manualFallbackTimer is declared below after interceptMode is known,
-        // but the reference is closed over here so settle() can clear it.
-        let manualFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+        // Guard: prevents triggerManualFallback() from being invoked twice
+        // (once from the about:blank location-poll signal, once from the closed-poll).
+        let fallbackShowing = false;
+        // True once the popup has been on a cross-origin page (nvidia.com login).
+        // When we subsequently see about:blank we know the redirect already fired.
+        let sawCrossOrigin = false;
 
         function settle(err?: Error) {
           if (settled) return;
           settled = true;
-          if (manualFallbackTimer !== null) { clearTimeout(manualFallbackTimer); manualFallbackTimer = null; }
           clearInterval(locationPoll);
           clearInterval(closedPoll);
           window.removeEventListener("message", onMessage);
@@ -141,10 +143,10 @@ function openLoginPopup(provider: string): Promise<void> {
           }
         }
 
-        // ── A) postMessage listener ──────────────────────────────────────────
+        // \u2500\u2500 A) postMessage listener \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         // Handles two sources:
-        //   • /auth/relay page (sends auth_code)
-        //   • server-side /api/auth/callback page (sends auth_success / auth_error)
+        //   \u2022 /auth/relay page (sends auth_code)
+        //   \u2022 server-side /api/auth/callback page (sends auth_success / auth_error)
         const onMessage = async (event: MessageEvent) => {
           if (typeof event.data !== "object" || event.data === null) return;
           const msg = event.data as Record<string, unknown>;
@@ -155,7 +157,7 @@ function openLoginPopup(provider: string): Promise<void> {
           } else if (msg.type === "auth_error") {
             settle(new Error((msg.error as string) ?? "Authentication failed"));
           } else if (msg.type === "auth_code") {
-            // Relay page handed us the raw code – exchange it now
+            // Relay page handed us the raw code \u2013 exchange it now
             const { code, state } = msg as { code: string; state: string };
             try {
               await exchangeCode(code, state);
@@ -167,20 +169,36 @@ function openLoginPopup(provider: string): Promise<void> {
         };
         window.addEventListener("message", onMessage);
 
-        // ── B) location polling (client-intercept / relay-page mode) ─────────
+        // \u2500\u2500 B) location polling (client-intercept / relay-page mode) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         // Reads popup.location.href every 100 ms.
-        // - Cross-origin pages (nvidia.com) → SecurityError, swallowed.
-        // - Same-origin relay page (/auth/relay) → relay posts auth_code via
-        //   postMessage (method A), but we also catch it here for redundancy.
-        // - Custom-scheme pages (geforcenow://...) → ERR_UNKNOWN_URL_SCHEME in
-        //   Chrome, which is cross-origin — SecurityError, unreadable. We cannot
-        //   extract the code this way. Method C (manual paste) is the fallback.
+        //
+        // Three observable states:
+        //   SecurityError  \u2192 popup is cross-origin (nvidia.com). Set sawCrossOrigin = true.
+        //   about:blank    \u2192 either the initial state (ignore) or the popup returned here
+        //                    AFTER being cross-origin. The latter happens in Chrome when
+        //                    localhost:2259 returns ERR_CONNECTION_REFUSED \u2014 the browser
+        //                    briefly lands the popup on about:blank before it closes.
+        //                    This is the earliest detectable signal; we trigger the
+        //                    manual-paste modal immediately rather than waiting for
+        //                    the closed-poll (method D).
+        //   same-origin    \u2192 relay page or our own callback; extract the code directly.
+        //
+        // BUG FIX: previously about:blank was ignored entirely. Now we use the
+        // sawCrossOrigin flag to distinguish "initial blank" from "post-redirect blank".
         const locationPoll = setInterval(async () => {
-          if (settled) return;
+          if (settled || fallbackShowing) return;
           try {
             const href = popup.location.href;
-            if (!href || href === "about:blank") return;
-            // Same-origin hit (relay page or our own callback)
+            if (!href || href === "about:blank") {
+              // about:blank AFTER we have seen nvidia.com = redirect already fired.
+              if (sawCrossOrigin && interceptMode === "client") {
+                clearInterval(locationPoll);
+                void triggerManualFallback();
+              }
+              // else: initial about:blank before popup navigated anywhere \u2014 ignore.
+              return;
+            }
+            // Same-origin hit (relay page or our own /api/auth/callback)
             const extracted = extractCodeFromUrl(href);
             if (extracted) {
               clearInterval(locationPoll);
@@ -192,39 +210,51 @@ function openLoginPopup(provider: string): Promise<void> {
               }
             }
           } catch {
-            // SecurityError expected while popup is cross-origin — keep polling
+            // SecurityError: popup is cross-origin (nvidia.com). Note that auth has started.
+            sawCrossOrigin = true;
           }
         }, 100);
 
-        // ── C) manual URL fallback ────────────────────────────────────────────
-        // When NVIDIA redirects to a loopback URI (e.g. http://localhost:2259)
-        // on a remote deployment, the popup lands on an ERR_CONNECTION_REFUSED page
-        // that we can't read cross-origin.  We fire a CustomEvent so the React app
-        // can display a proper in-page modal asking the user to paste the URL.
-        // Falls back to window.prompt if no handler is registered (e.g. during tests).
-        const MANUAL_FALLBACK_DELAY_MS = 2_000;
+        // \u2500\u2500 C) manual URL fallback \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        // Fires when the popup closes (or transitions to about:blank) after the user
+        // completed the NVIDIA login but the redirect target is localhost:2259 \u2014
+        // unreachable on a remote deployment.
+        //
+        // We dispatch a CustomEvent so the React app shows an in-page modal asking
+        // the user to paste the full redirect URL from the popup\u2019s address bar
+        // (e.g. http://localhost:2259/?state=\u2026&code=\u2026).
+        //
+        // BUG FIX: the old code had `if (popup.closed) { settle(error); return; }` at
+        // the top of this function. That was wrong: the closed-poll (D) calls this
+        // function precisely because the popup closed, so bail-on-closed meant the
+        // modal could NEVER appear after ERR_CONNECTION_REFUSED. Removed.
+        // fallbackShowing prevents double-invocation instead.
+        //
+        // BUG FIX: the old code also used a MANUAL_FALLBACK_DELAY_MS = 2_000 timer
+        // that fired 2 seconds after the popup opened \u2014 before the user had even
+        // finished logging in. That timer is removed entirely; method B and D are the
+        // correct triggers.
+        async function triggerManualFallback() {
+          if (settled || fallbackShowing) return;
+          fallbackShowing = true;
 
-        async function tryManualFallback() {
-          if (settled) return;
-          // Check one more time if the popup closed cleanly
-          if (popup.closed) {
-            settle(new Error("Login window closed before completing sign-in."));
-            return;
-          }
           const pasted = await new Promise<string | null>((resolveInput) => {
             window.dispatchEvent(
               new CustomEvent("opennow:auth:needs-url", { detail: { resolve: resolveInput } })
             );
           });
+
+          fallbackShowing = false;
+
           if (!pasted) {
-            settle(new Error("Login cancelled — no redirect URL was provided."));
+            settle(new Error("Login cancelled \u2014 no redirect URL was provided."));
             return;
           }
           const extracted = extractCodeFromUrl(pasted.trim());
           if (!extracted) {
             settle(new Error(
-              "Couldn't find an auth code in the pasted URL.\n" +
-              "Make sure you copied the full URL including ?code=…&state=…",
+              "Couldn\u2019t find an auth code in the pasted URL.\n" +
+              "Make sure you copied the full URL including ?code=\u2026&state=\u2026",
             ));
             return;
           }
@@ -236,21 +266,25 @@ function openLoginPopup(provider: string): Promise<void> {
           }
         }
 
-        if (interceptMode === "client") {
-          manualFallbackTimer = setTimeout(tryManualFallback, MANUAL_FALLBACK_DELAY_MS);
-        }
-
-        // ── D) closed-without-auth guard ──────────────────────────────────────
+        // \u2500\u2500 D) closed-without-auth guard \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        // Polls every 300 ms. When the popup closes:
+        //   server-intercept mode \u2192 user closed before finishing; hard error.
+        //   client-intercept mode \u2192 redirect to localhost:2259 caused ERR_CONNECTION_REFUSED
+        //                           which closed the popup. We MUST show the manual-paste
+        //                           modal, NOT immediately fail.
+        //
+        // BUG FIX: the old code only called tryManualFallback() when
+        // `manualFallbackTimer !== null`. After the premature 2 s timer fired,
+        // the timer was cleared (null), so a subsequent popup close always hit the
+        // `else` branch \u2014 calling settle(error) and skipping the modal entirely.
+        // Timer removed; client mode now always calls triggerManualFallback().
+        // fallbackShowing prevents double-invoke if method B already fired first.
         const closedPoll = setInterval(() => {
-          if (settled) return;
+          if (settled || fallbackShowing) return;
           if (popup.closed) {
-            if (interceptMode === "client" && manualFallbackTimer !== null) {
-              // Popup closed while we're still waiting — trigger manual fallback
-              // immediately rather than waiting for the timer (scheme may have
-              // been handled by an installed app, leaving the URL in a browser bar).
-              clearTimeout(manualFallbackTimer);
-              manualFallbackTimer = null;
-              void tryManualFallback();
+            clearInterval(closedPoll);
+            if (interceptMode === "client") {
+              void triggerManualFallback();
             } else {
               settle(new Error("Login window closed before completing sign-in."));
             }
@@ -262,7 +296,6 @@ function openLoginPopup(provider: string): Promise<void> {
       });
   });
 }
-
 // ─── Stubs for features that are browser-unavailable ────────────────────────
 
 const defaultRefreshStatus: AuthRefreshStatus = {
