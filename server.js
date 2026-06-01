@@ -288,7 +288,9 @@ async function gfnFetch(url, accessToken, options = {}) {
   const headers = {
     Accept: "application/json",
     "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0 OpenNOW-Web/0.1",
+    "User-Agent": GFN_USER_AGENT,          // must match the real GFN client UA
+    Referer: `${new URL(NVIDIA_AUTH_URL).origin}/`,
+    Origin: new URL(NVIDIA_AUTH_URL).origin,
     ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
     ...(options.headers ?? {}),
   };
