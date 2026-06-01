@@ -298,7 +298,18 @@ async function gfnFetch(url, accessToken, options = {}) {
     method: options.method ?? "GET",
     headers,
     body: options.body ?? undefined,
+    redirect: "follow",
   });
+  // Detect login-wall: NVIDIA redirects to an HTML login page when the token
+  // is rejected instead of returning a 401. res.ok is true (200) but the body
+  // is HTML, so res.json() throws a SyntaxError with no .status → silent 502.
+  const ct = res.headers.get("content-type") ?? "";
+  if (ct.includes("text/html")) {
+    throw Object.assign(
+      new Error(`GFN API returned HTML login wall (token rejected or expired) for ${url}`),
+      { status: 401 }
+    );
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw Object.assign(new Error(`GFN API ${res.status}: ${text.slice(0, 200)}`), {
@@ -353,7 +364,10 @@ async function ensureValidToken(req) {
       // Return existing token anyway; it might still work
     }
   }
-  return tokens.idToken ?? tokens.accessToken;
+  // NVIDIA's GFN API requires the access token for authorisation.
+  // The id_token is an OpenID Connect identity assertion — sending it as a
+  // Bearer token causes NVIDIA to return a login-wall HTML page (→ 502).
+  return tokens.accessToken ?? tokens.idToken;
 }
 
 // ─── Auth routes ────────────────────────────────────────────────────────────
