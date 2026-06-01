@@ -35,6 +35,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = parseInt(process.env.PORT ?? "8080", 10);
 
+// ─── Process-level crash guards ─────────────────────────────────────────────
+// Prevent unhandled async errors from killing the Node process on Koyeb.
+process.on("unhandledRejection", (reason) => {
+  console.error("[opennow-web] Unhandled rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[opennow-web] Uncaught exception:", err);
+});
+
 // ─── Static frontend ───────────────────────────────────────────────────────
 const DIST_DIR = path.join(__dirname, "dist");
 
@@ -70,15 +79,15 @@ const _SIGNING_KEY  = process.env.SESSION_SECRET ?? "changeme-set-SESSION_SECRET
 
 function pkceSetCookie(res, state, codeVerifier) {
   const payload = Buffer.from(JSON.stringify({ state, codeVerifier, ts: Date.now() }))
-    .toString("base64url");
+  .toString("base64url");
   const sig = crypto.createHmac("sha256", _SIGNING_KEY).update(payload).digest("base64url");
   // res.cookie() uses res.append("Set-Cookie") internally — safe alongside session cookies.
   res.cookie(_PKCE_COOKIE, `${payload}.${sig}`, {
     httpOnly: true,
     secure: APP_BASE_URL.startsWith("https://"),
-    sameSite: "lax",
-    maxAge: 10 * 60 * 1000, // 10 minutes — plenty for a login flow
-    path: "/",
+             sameSite: "lax",
+             maxAge: 10 * 60 * 1000, // 10 minutes — plenty for a login flow
+             path: "/",
   });
 }
 
@@ -126,9 +135,9 @@ function authSetCookie(res, authSession) {
     res.cookie(_AUTH_COOKIE, `${payload}.${sig}`, {
       httpOnly: true,
       secure: APP_BASE_URL.startsWith("https://"),
-      sameSite: "lax",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days (match session maxAge)
-      path: "/",
+               sameSite: "lax",
+               maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days (match session maxAge)
+    path: "/",
     });
   } catch (e) {
     // Non-fatal: session will still work if the cookie is too large to set
@@ -216,7 +225,14 @@ const DEFAULT_IDP_ID = NVIDIA_IDP_ID;
 // GFN API base URL – comes from the provider but this is the production default.
 // Override with GFN_STREAMING_BASE_URL env var if needed.
 const GFN_STREAMING_BASE_URL =
-  (process.env.GFN_STREAMING_BASE_URL ?? "https://api.prod.nvidia.com/gfnpc/v2").replace(/\/$/, "");
+(process.env.GFN_STREAMING_BASE_URL ?? "https://api.prod.nvidia.com/gfnpc/v2").replace(/\/$/, "");
+
+// ─── Trust proxy ──────────────────────────────────────────────────────────
+// Koyeb (and Cloudflare in front of it) terminate TLS and forward requests
+// over plain HTTP internally.  Without this, Express sees req.secure=false
+// and express-session refuses to set cookies marked Secure, meaning the
+// connect.sid session cookie is NEVER sent to the browser.
+app.set("trust proxy", 1);
 
 // ─── Session ───────────────────────────────────────────────────────────────
 app.use(
@@ -227,8 +243,8 @@ app.use(
     cookie: {
       httpOnly: true,
       secure: APP_BASE_URL.startsWith("https://"),
-      sameSite: "lax",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+          sameSite: "lax",
+          maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     },
   })
 );
@@ -251,15 +267,15 @@ function generateCodeChallenge(verifier) {
 // Server-side we don't have a per-user hostname, so we use a stable value
 // derived from the server identity (consistent across restarts).
 const SERVER_DEVICE_ID = crypto
-  .createHash("sha256")
-  .update(`opennow-web:${process.env.APP_BASE_URL ?? "localhost"}:opennow-stable`)
-  .digest("hex");
+.createHash("sha256")
+.update(`opennow-web:${process.env.APP_BASE_URL ?? "localhost"}:opennow-stable`)
+.digest("hex");
 
 // Headers that mirror what the desktop app's buildNvidiaAuthHeaders sends.
 // The GFN auth server checks User-Agent and Referer; without them token
 // exchanges can silently fail with a 4xx.
 const GFN_USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 GFNClient/2.0";
+"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 GFNClient/2.0";
 
 function nvidiaAuthHeaders(extra = {}) {
   const authOrigin = new URL(NVIDIA_AUTH_URL).origin;
@@ -294,12 +310,29 @@ async function gfnFetch(url, accessToken, options = {}) {
     ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
     ...(options.headers ?? {}),
   };
-  const res = await fetch(url, {
-    method: options.method ?? "GET",
-    headers,
-    body: options.body ?? undefined,
-    redirect: "follow",
-  });
+  // Hard timeout so a hung NVIDIA connection doesn't block forever, causing
+  // Koyeb to time out the whole request and Cloudflare to serve a 502 page.
+  const timeoutMs = parseInt(process.env.GFN_FETCH_TIMEOUT_MS ?? "15000", 10);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(url, {
+      method: options.method ?? "GET",
+      headers,
+      body: options.body ?? undefined,
+      redirect: "follow",
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    const isTimeout = err.name === "AbortError";
+    throw Object.assign(
+      new Error(isTimeout ? `GFN API request timed out after ${timeoutMs}ms for ${url}` : `GFN API network error for ${url}: ${err.message}`),
+      { status: isTimeout ? 504 : 502 }
+    );
+  }
+  clearTimeout(timer);
   // Detect login-wall: NVIDIA redirects to an HTML login page when the token
   // is rejected instead of returning a 401. res.ok is true (200) but the body
   // is HTML, so res.json() throws a SyntaxError with no .status → silent 502.
@@ -307,7 +340,7 @@ async function gfnFetch(url, accessToken, options = {}) {
   if (ct.includes("text/html")) {
     throw Object.assign(
       new Error(`GFN API returned HTML login wall (token rejected or expired) for ${url}`),
-      { status: 401 }
+                        { status: 401 }
     );
   }
   if (!res.ok) {
@@ -385,8 +418,8 @@ app.get("/api/auth/providers", async (_req, res) => {
         idpId: "nvidia",
         code: "NVIDIA",
         displayName: "NVIDIA (configure NVIDIA_CLIENT_ID)",
-        streamingServiceUrl: GFN_STREAMING_BASE_URL,
-        priority: 0,
+                    streamingServiceUrl: GFN_STREAMING_BASE_URL,
+                    priority: 0,
       },
     ]);
   }
@@ -464,8 +497,8 @@ app.get("/api/auth/callback", async (req, res) => {
     const tokenBody = new URLSearchParams({
       grant_type: "authorization_code",
       code: String(code),
-      redirect_uri: REDIRECT_URI,
-      code_verifier: codeVerifier,
+                                          redirect_uri: REDIRECT_URI,
+                                          code_verifier: codeVerifier,
     });
 
     const tokenRes = await fetch(NVIDIA_TOKEN_URL, {
@@ -544,22 +577,22 @@ app.get("/api/auth/callback", async (req, res) => {
 
 function popupResultHtml(session, error) {
   const payload = session
-    ? JSON.stringify({ type: "auth_success" })
-    : JSON.stringify({ type: "auth_error", error: error ?? "Unknown error" });
+  ? JSON.stringify({ type: "auth_success" })
+  : JSON.stringify({ type: "auth_error", error: error ?? "Unknown error" });
   return `<!DOCTYPE html>
-<html><head><title>Signing in…</title>
-<style>body{display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
-  background:#0a0a0a;color:#e5e5e5;font-family:sans-serif;}</style>
-</head><body>
-${error
-  ? `<div style="text-align:center"><h2>❌ Login failed</h2><p>${error}</p></div>`
-  : `<div style="text-align:center"><h2>✅ Signed in</h2><p>Returning to OpenNOW…</p></div>`
-}
-<script>
-  try { window.opener.postMessage(${payload}, '*'); } catch(e) {}
-  setTimeout(() => window.close(), 1200);
-</script>
-</body></html>`;
+  <html><head><title>Signing in…</title>
+  <style>body{display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
+    background:#0a0a0a;color:#e5e5e5;font-family:sans-serif;}</style>
+    </head><body>
+    ${error
+      ? `<div style="text-align:center"><h2>❌ Login failed</h2><p>${error}</p></div>`
+      : `<div style="text-align:center"><h2>✅ Signed in</h2><p>Returning to OpenNOW…</p></div>`
+    }
+    <script>
+    try { window.opener.postMessage(${payload}, '*'); } catch(e) {}
+    setTimeout(() => window.close(), 1200);
+    </script>
+    </body></html>`;
 }
 
 // GET /api/auth/session
@@ -639,12 +672,12 @@ const GFN_ALLOWED_HOSTS = [
   "login.nvidia.com",           // auth endpoints (login.nvidia.com/authorize|token|userinfo)
   "accounts.nvgs.nvidia.com",   // NVGS internal OAuth cluster (seen in proxy redirect chain)
   "pcs.geforcenow.com",         // service URLs / provider discovery
-  "api.prod.nvidia.com",
-  "api.nvidiagfn.com",
-  "cloudmatch.nvidiagrid.net",
-  "cloudmatchbeta.nvidiagrid.net",
-  "geforcenow.nvidiagrid.net",
-  "login.nvgs.nvidia.com",      // NVGS/native client auth (Linux/Windows desktop app registrations)
+"api.prod.nvidia.com",
+"api.nvidiagfn.com",
+"cloudmatch.nvidiagrid.net",
+"cloudmatchbeta.nvidiagrid.net",
+"geforcenow.nvidiagrid.net",
+"login.nvgs.nvidia.com",      // NVGS/native client auth (Linux/Windows desktop app registrations)
 ];
 
 function isAllowedGfnUrl(urlStr) {
@@ -660,23 +693,23 @@ function isAllowedGfnUrl(urlStr) {
 // Body: { url: string, method?: string, body?: any }
 // The web-shim sends the full target URL. We attach auth and forward.
 app.post("/api/gfn/proxy", async (req, res) => {
-  const { url, method = "GET", body } = req.body ?? {};
-  if (!url) return res.status(400).json({ error: "url required" });
-  if (!isAllowedGfnUrl(url)) {
-    return res.status(403).json({ error: `Host not in GFN allowlist: ${new URL(url).hostname}` });
-  }
-
-  const token = await ensureValidToken(req);
-  if (!token) return res.status(401).json({ error: "Not authenticated" });
-
   try {
+    const { url, method = "GET", body } = req.body ?? {};
+    if (!url) return res.status(400).json({ error: "url required" });
+    if (!isAllowedGfnUrl(url)) {
+      return res.status(403).json({ error: `Host not in GFN allowlist: ${new URL(url).hostname}` });
+    }
+
+    const token = await ensureValidToken(req);
+    if (!token) return res.status(401).json({ error: "Not authenticated" });
+
     const data = await gfnFetch(url, token, {
       method,
       body: body ? JSON.stringify(body) : undefined,
     });
     res.json(data);
   } catch (err) {
-    console.error(`[gfn-proxy] ${method} ${url} → ${err.message}`);
+    console.error(`[gfn-proxy] ${req.body?.method ?? "?"} ${req.body?.url ?? "?"} → ${err.message}`);
     res.status(err.status ?? 502).json({ error: err.message });
   }
 });
@@ -718,29 +751,29 @@ const GFN_METHODS = {
 };
 
 app.post("/api/gfn/call", async (req, res) => {
-  const { method, input } = req.body ?? {};
-  if (!method) return res.status(400).json({ error: "method required" });
-
-  const builder = GFN_METHODS[method];
-  if (!builder) return res.status(400).json({ error: `Unknown GFN method: ${method}` });
-
-  const token = await ensureValidToken(req);
-  if (!token) return res.status(401).json({ error: "Not authenticated" });
-
-  const { session: { authSession } = {} } = req;
-  const baseUrl = (input?.providerStreamingBaseUrl ?? authSession?.provider?.streamingServiceUrl ?? GFN_STREAMING_BASE_URL).replace(/\/$/, "");
-
-  const { url, method: httpMethod, body } = builder(baseUrl, input);
-
-  if (!isAllowedGfnUrl(url)) {
-    return res.status(403).json({ error: `Host not in allowlist` });
-  }
-
   try {
+    const { method, input } = req.body ?? {};
+    if (!method) return res.status(400).json({ error: "method required" });
+
+    const builder = GFN_METHODS[method];
+    if (!builder) return res.status(400).json({ error: `Unknown GFN method: ${method}` });
+
+    const token = await ensureValidToken(req);
+    if (!token) return res.status(401).json({ error: "Not authenticated" });
+
+    const { session: { authSession } = {} } = req;
+    const baseUrl = (input?.providerStreamingBaseUrl ?? authSession?.provider?.streamingServiceUrl ?? GFN_STREAMING_BASE_URL).replace(/\/$/, "");
+
+    const { url, method: httpMethod, body } = builder(baseUrl, input);
+
+    if (!isAllowedGfnUrl(url)) {
+      return res.status(403).json({ error: `Host not in allowlist` });
+    }
+
     const data = await gfnFetch(url, token, { method: httpMethod, body: body ? JSON.stringify(body) : undefined });
     res.json(data);
   } catch (err) {
-    console.error(`[gfn-call] ${method} → ${url}: ${err.message}`);
+    console.error(`[gfn-call] ${req.body?.method ?? "?"} → ${err.message}`);
     res.status(err.status ?? 502).json({ error: err.message });
   }
 });
@@ -835,8 +868,8 @@ app.post("/api/auth/exchange", async (req, res) => {
     const tokenBody = new URLSearchParams({
       grant_type: "authorization_code",
       code: String(code),
-      redirect_uri: REDIRECT_URI,
-      code_verifier: codeVerifier,
+                                          redirect_uri: REDIRECT_URI,
+                                          code_verifier: codeVerifier,
     });
 
     const tokenRes = await fetch(NVIDIA_TOKEN_URL, {
@@ -869,9 +902,9 @@ app.post("/api/auth/exchange", async (req, res) => {
       userInfo = {
         sub: claims.sub,
         name: claims.preferred_username ?? claims.email?.split("@")[0] ?? "NVIDIA User",
-        email: claims.email ?? null,
-        picture: claims.picture ?? null,
-        membershipTier: claims.gfn_tier ?? "FREE",
+         email: claims.email ?? null,
+         picture: claims.picture ?? null,
+         membershipTier: claims.gfn_tier ?? "FREE",
       };
     } else {
       const uiRes = await fetch(NVIDIA_USERINFO_URL, {
@@ -924,125 +957,159 @@ app.post("/api/auth/exchange", async (req, res) => {
 const RELAY_HTML = `<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>Completing sign-in…</title>
-  <style>
-    body { display:flex; align-items:center; justify-content:center;
-           height:100vh; margin:0; background:#0a0a0a; color:#e5e5e5;
-           font-family:system-ui,sans-serif; font-size:14px; }
-    .msg { text-align:center; opacity:.7; }
-    .dot { display:inline-block; animation: blink 1s step-start infinite; }
-    @keyframes blink { 50% { opacity:0; } }
+<meta charset="utf-8">
+<title>Completing sign-in…</title>
+<style>
+body { display:flex; align-items:center; justify-content:center;
+  height:100vh; margin:0; background:#0a0a0a; color:#e5e5e5;
+  font-family:system-ui,sans-serif; font-size:14px; }
+  .msg { text-align:center; opacity:.7; }
+  .dot { display:inline-block; animation: blink 1s step-start infinite; }
+  @keyframes blink { 50% { opacity:0; } }
   </style>
-</head>
-<body>
+  </head>
+  <body>
   <div class="msg">Completing sign-in<span class="dot">…</span></div>
   <script>
-    (function () {
-      var params = new URLSearchParams(window.location.search);
-      var code  = params.get('code');
-      var state = params.get('state');
-      var error = params.get('error');
-      var target = window.opener || (window.parent !== window ? window.parent : null);
+  (function () {
+    var params = new URLSearchParams(window.location.search);
+    var code  = params.get('code');
+    var state = params.get('state');
+    var error = params.get('error');
+    var target = window.opener || (window.parent !== window ? window.parent : null);
 
-      function send(msg) {
-        if (target) {
-          // Try same-origin first; fall back to '*' so this works during local dev
-          try { target.postMessage(msg, window.location.origin); } catch (_) {}
-          try { target.postMessage(msg, '*'); } catch (_) {}
-        }
-        // Small delay so the message has time to be received before the window closes
-        setTimeout(function () { window.close(); }, 800);
+    function send(msg) {
+      if (target) {
+        // Try same-origin first; fall back to '*' so this works during local dev
+        try { target.postMessage(msg, window.location.origin); } catch (_) {}
+        try { target.postMessage(msg, '*'); } catch (_) {}
       }
+      // Small delay so the message has time to be received before the window closes
+      setTimeout(function () { window.close(); }, 800);
+    }
 
-      if (error) {
-        send({ type: 'auth_error', error: decodeURIComponent(error) });
-      } else if (code && state) {
-        send({ type: 'auth_code', code: code, state: state });
-      } else {
-        send({ type: 'auth_error', error: 'No code or error in redirect URL' });
-      }
-    })();
-  </script>
-</body>
-</html>`;
-
-app.get(["/auth/relay", "/auth/relay.html"], (_req, res) => {
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  // Must not be cached — each login attempt gets a fresh relay
-  res.setHeader("Cache-Control", "no-store");
-  res.send(RELAY_HTML);
-});
-
-// ─── Serve frontend ────────────────────────────────────────────────────────
-app.use(express.static(DIST_DIR));
-// SPA fallback – all non-API routes serve index.html
-app.get(/^(?!\/api\/).*$/, (_req, res) => {
-  res.sendFile(path.join(DIST_DIR, "index.html"));
-});
-
-// ─── Auxiliary localhost OAuth listener ─────────────────────────────────────
-// When NVIDIA_REDIRECT_URI is a loopback URL (e.g. http://localhost:2259),
-// NVIDIA will redirect the popup browser to that port on the USER's machine.
-// For LOCAL deployments (where this server IS on the user's machine) we start
-// a tiny auxiliary HTTP listener on that port to receive the callback and
-// forward the code back to our main server's /api/auth/callback handler.
-//
-// This does NOT help for remote deployments (e.g. Koyeb) because localhost:PORT
-// on the user's browser points to their own machine, not the Koyeb server.
-// For remote deployments, use a custom-scheme redirect URI (NVIDIA_REDIRECT_URI=geforcenow://open)
-// instead, and the client-side popup trick handles the code interception.
-(function startLocalhostAuxListener() {
-  if (!REDIRECT_URI) return;
-  let loopbackMatch;
-  try {
-    const u = new URL(REDIRECT_URI);
-    const isLoopback = u.hostname === "localhost" || u.hostname === "127.0.0.1";
-    if (!isLoopback) return;
-    const auxPort = parseInt(u.port || "80", 10);
-    if (isNaN(auxPort) || auxPort === PORT) return; // same port as main server — no-op
-    loopbackMatch = { port: auxPort, path: u.pathname };
-  } catch {
-    return;
-  }
-
-  const aux = express();
-  aux.get(loopbackMatch.path || "/", (req, res) => {
-    const { code, state, error } = req.query;
     if (error) {
-      // Redirect to our main server's callback so it can render the error page
-      return res.redirect(`${APP_BASE_URL}/api/auth/callback?error=${encodeURIComponent(error)}`);
+      send({ type: 'auth_error', error: decodeURIComponent(error) });
+    } else if (code && state) {
+      send({ type: 'auth_code', code: code, state: state });
+    } else {
+      send({ type: 'auth_error', error: 'No code or error in redirect URL' });
     }
-    if (code && state) {
-      return res.redirect(
-        `${APP_BASE_URL}/api/auth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`
-      );
-    }
-    res.status(400).send("Missing code or state in OAuth callback");
-  });
-  aux.listen(loopbackMatch.port, "127.0.0.1", () => {
-    console.log(`[opennow-web] Aux OAuth listener → http://127.0.0.1:${loopbackMatch.port} (forwarding to ${APP_BASE_URL}/api/auth/callback)`);
-  }).on("error", (err) => {
-    console.warn(`[opennow-web] ⚠️  Could not start aux OAuth listener on port ${loopbackMatch.port}: ${err.message}`);
-    console.warn(`[opennow-web]    If nothing else is using that port, the server-side callback won't work for local deployments.`);
-  });
-})();
+  })();
+  </script>
+  </body>
+  </html>`;
 
-// ─── Start ─────────────────────────────────────────────────────────────────
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[opennow-web] Listening on http://0.0.0.0:${PORT}`);
-  const mode = isClientInterceptedRedirectUri(REDIRECT_URI) ? "client-intercepted popup" : "server-side callback";
-  console.log(`[opennow-web] OAuth mode: ${mode} — redirect URI: ${REDIRECT_URI}`);
-  console.log(`[opennow-web] Auth base: ${_AUTH_BASE}`);
-  console.log(`[opennow-web] Scopes: ${NVIDIA_OAUTH_SCOPES}`);
-  console.log(`[opennow-web] idp_id: ${NVIDIA_IDP_ID || "(omitted)"}`);
-  console.log(`[opennow-web] device_id: ${process.env.NVIDIA_SKIP_DEVICE_ID === "true" ? "(omitted)" : SERVER_DEVICE_ID}`);
-  if (process.env.NVIDIA_CLIENT_ID) {
-    console.log(`[opennow-web] Using custom NVIDIA_CLIENT_ID from env`);
-  } else {
-    console.log(`[opennow-web] Using built-in OpenNOW desktop client_id (default)`);
-  }
-  if (!process.env.SESSION_SECRET) {
-    console.warn("[opennow-web] ⚠️  SESSION_SECRET is not set — using insecure default. Set it in production!");
-  }
-});
+  app.get(["/auth/relay", "/auth/relay.html"], (_req, res) => {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    // Must not be cached — each login attempt gets a fresh relay
+    res.setHeader("Cache-Control", "no-store");
+    res.send(RELAY_HTML);
+  });
+
+  // ─── Diagnostics endpoint ──────────────────────────────────────────────────
+  // GET /api/debug/gfn-ping  — tests outbound connectivity to NVIDIA's GFN API.
+  // Useful for confirming that Koyeb's egress can actually reach NVIDIA servers.
+  // Remove or restrict in production once confirmed working.
+  app.get("/api/debug/gfn-ping", async (req, res) => {
+    const testUrl = `${GFN_STREAMING_BASE_URL}/identity/loginProviders`;
+    const start = Date.now();
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 10000);
+      const r = await fetch(testUrl, {
+        headers: { "User-Agent": GFN_USER_AGENT, Accept: "application/json" },
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      const ct = r.headers.get("content-type") ?? "";
+      const body = ct.includes("application/json") ? await r.json().catch(() => "(json parse failed)") : await r.text().catch(() => "(body read failed)").then(t => t.slice(0, 200));
+      res.json({ ok: r.ok, status: r.status, contentType: ct, durationMs: Date.now() - start, body });
+    } catch (err) {
+      res.status(502).json({ ok: false, error: err.message, durationMs: Date.now() - start });
+    }
+  });
+
+  // ─── Global Express error handler ─────────────────────────────────────────
+  // Catches any errors that bubble up from async route handlers.
+  // Without this, Express 4 logs but does NOT respond, leaving the client hanging.
+  // eslint-disable-next-line no-unused-vars
+  app.use((err, req, res, next) => {
+    console.error("[opennow-web] Unhandled route error:", err);
+    if (!res.headersSent) {
+      res.status(err.status ?? 500).json({ error: err.message ?? "Internal server error" });
+    }
+  });
+
+  // ─── Serve frontend ────────────────────────────────────────────────────────
+  app.use(express.static(DIST_DIR));
+  // SPA fallback – all non-API routes serve index.html
+  app.get(/^(?!\/api\/).*$/, (_req, res) => {
+    res.sendFile(path.join(DIST_DIR, "index.html"));
+  });
+
+  // ─── Auxiliary localhost OAuth listener ─────────────────────────────────────
+  // When NVIDIA_REDIRECT_URI is a loopback URL (e.g. http://localhost:2259),
+  // NVIDIA will redirect the popup browser to that port on the USER's machine.
+  // For LOCAL deployments (where this server IS on the user's machine) we start
+  // a tiny auxiliary HTTP listener on that port to receive the callback and
+  // forward the code back to our main server's /api/auth/callback handler.
+  //
+  // This does NOT help for remote deployments (e.g. Koyeb) because localhost:PORT
+  // on the user's browser points to their own machine, not the Koyeb server.
+  // For remote deployments, use a custom-scheme redirect URI (NVIDIA_REDIRECT_URI=geforcenow://open)
+  // instead, and the client-side popup trick handles the code interception.
+  (function startLocalhostAuxListener() {
+    if (!REDIRECT_URI) return;
+    let loopbackMatch;
+    try {
+      const u = new URL(REDIRECT_URI);
+      const isLoopback = u.hostname === "localhost" || u.hostname === "127.0.0.1";
+      if (!isLoopback) return;
+      const auxPort = parseInt(u.port || "80", 10);
+      if (isNaN(auxPort) || auxPort === PORT) return; // same port as main server — no-op
+      loopbackMatch = { port: auxPort, path: u.pathname };
+    } catch {
+      return;
+    }
+
+    const aux = express();
+    aux.get(loopbackMatch.path || "/", (req, res) => {
+      const { code, state, error } = req.query;
+      if (error) {
+        // Redirect to our main server's callback so it can render the error page
+        return res.redirect(`${APP_BASE_URL}/api/auth/callback?error=${encodeURIComponent(error)}`);
+      }
+      if (code && state) {
+        return res.redirect(
+          `${APP_BASE_URL}/api/auth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`
+        );
+      }
+      res.status(400).send("Missing code or state in OAuth callback");
+    });
+    aux.listen(loopbackMatch.port, "127.0.0.1", () => {
+      console.log(`[opennow-web] Aux OAuth listener → http://127.0.0.1:${loopbackMatch.port} (forwarding to ${APP_BASE_URL}/api/auth/callback)`);
+    }).on("error", (err) => {
+      console.warn(`[opennow-web] ⚠️  Could not start aux OAuth listener on port ${loopbackMatch.port}: ${err.message}`);
+      console.warn(`[opennow-web]    If nothing else is using that port, the server-side callback won't work for local deployments.`);
+    });
+  })();
+
+  // ─── Start ─────────────────────────────────────────────────────────────────
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[opennow-web] Listening on http://0.0.0.0:${PORT}`);
+    const mode = isClientInterceptedRedirectUri(REDIRECT_URI) ? "client-intercepted popup" : "server-side callback";
+    console.log(`[opennow-web] OAuth mode: ${mode} — redirect URI: ${REDIRECT_URI}`);
+    console.log(`[opennow-web] Auth base: ${_AUTH_BASE}`);
+    console.log(`[opennow-web] Scopes: ${NVIDIA_OAUTH_SCOPES}`);
+    console.log(`[opennow-web] idp_id: ${NVIDIA_IDP_ID || "(omitted)"}`);
+    console.log(`[opennow-web] device_id: ${process.env.NVIDIA_SKIP_DEVICE_ID === "true" ? "(omitted)" : SERVER_DEVICE_ID}`);
+    if (process.env.NVIDIA_CLIENT_ID) {
+      console.log(`[opennow-web] Using custom NVIDIA_CLIENT_ID from env`);
+    } else {
+      console.log(`[opennow-web] Using built-in OpenNOW desktop client_id (default)`);
+    }
+    if (!process.env.SESSION_SECRET) {
+      console.warn("[opennow-web] ⚠️  SESSION_SECRET is not set — using insecure default. Set it in production!");
+    }
+  });
