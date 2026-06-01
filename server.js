@@ -108,6 +108,57 @@ function pkceClearCookie(res) {
   res.clearCookie(_PKCE_COOKIE, { path: "/" });
 }
 
+// ─── Auth-session cookie helpers ────────────────────────────────────────────
+// After a successful exchange, the full auth session (including refresh token)
+// is stored in a signed HMAC cookie in addition to the MemoryStore session.
+// When the container restarts and the session is wiped, /api/auth/session reads
+// the cookie as a fallback so the user stays logged in.
+//
+// The cookie is HttpOnly (JS can't read it) and signed, so it can't be forged
+// or tampered with.  The refresh token is included so ensureValidToken() can
+// still silently refresh after a restart.
+const _AUTH_COOKIE = "opennow_auth";
+
+function authSetCookie(res, authSession) {
+  try {
+    const payload = Buffer.from(JSON.stringify(authSession)).toString("base64url");
+    const sig = crypto.createHmac("sha256", _SIGNING_KEY).update(payload).digest("base64url");
+    res.cookie(_AUTH_COOKIE, `${payload}.${sig}`, {
+      httpOnly: true,
+      secure: APP_BASE_URL.startsWith("https://"),
+      sameSite: "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days (match session maxAge)
+      path: "/",
+    });
+  } catch (e) {
+    // Non-fatal: session will still work if the cookie is too large to set
+    console.warn("[auth] authSetCookie failed (payload may be too large):", e.message);
+  }
+}
+
+function authReadCookie(req) {
+  const raw = req.headers.cookie ?? "";
+  const entry = raw.split(";").map(s => s.trim()).find(s => s.startsWith(_AUTH_COOKIE + "="));
+  if (!entry) return null;
+  try {
+    const val      = decodeURIComponent(entry.slice(_AUTH_COOKIE.length + 1));
+    const dot      = val.lastIndexOf(".");
+    if (dot === -1) return null;
+    const payload  = val.slice(0, dot);
+    const sig      = val.slice(dot + 1);
+    const expected = crypto.createHmac("sha256", _SIGNING_KEY).update(payload).digest("base64url");
+    if (sig !== expected) { console.warn("[auth] auth cookie sig mismatch"); return null; }
+    return JSON.parse(Buffer.from(payload, "base64url").toString());
+  } catch (e) {
+    console.warn("[auth] authReadCookie parse error:", e.message);
+    return null;
+  }
+}
+
+function authClearCookie(res) {
+  res.clearCookie(_AUTH_COOKIE, { path: "/" });
+}
+
 // A redirect URI is "client-intercepted" when it cannot land on our server
 // (custom schemes, localhost loopback, or the explicit relay page path).
 // In those cases the popup itself hands us the auth code via postMessage or
@@ -489,11 +540,17 @@ ${error
 // GET /api/auth/session
 // Returns the current session (safe to expose to the frontend — no raw tokens).
 app.get("/api/auth/session", async (req, res) => {
+  // Primary: MemoryStore session.  Fallback: signed auth cookie (survives restarts).
   if (!req.session?.authSession) {
-    return res.json({
-      session: null,
-      refresh: { attempted: false, forced: false, outcome: "not_attempted", message: "" },
-    });
+    const fromCookie = authReadCookie(req);
+    if (!fromCookie) {
+      return res.json({
+        session: null,
+        refresh: { attempted: false, forced: false, outcome: "not_attempted", message: "" },
+      });
+    }
+    console.log("[auth] Restoring authSession from cookie (session was wiped)");
+    req.session.authSession = fromCookie;
   }
   // Opportunistically refresh if needed
   const token = await ensureValidToken(req);
@@ -530,6 +587,7 @@ app.post("/api/auth/logout", async (req, res) => {
       }),
     }).catch(() => {});
   }
+  authClearCookie(res); // clear the persistent auth cookie too
   req.session.destroy(() => res.json({ ok: true }));
 });
 
@@ -821,7 +879,10 @@ app.post("/api/auth/exchange", async (req, res) => {
     delete req.session.oauthState;
     delete req.session.oauthCodeVerifier;
     delete req.session.oauthProvider;
-    pkceClearCookie(res); // cookie is single-use; clear it so it can't be replayed
+    pkceClearCookie(res); // single-use — clear so it can't be replayed
+    // Persist the auth session in a signed cookie so /api/auth/session can
+    // recover it if the MemoryStore is wiped by a container restart.
+    authSetCookie(res, req.session.authSession);
 
     res.json({ ok: true });
   } catch (err) {
