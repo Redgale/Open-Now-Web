@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import type { JSX } from "react";
-import { LogIn, ChevronDown } from "lucide-react";
+import { LogIn, ChevronDown, Link } from "lucide-react";
 import type { LoginProvider } from "@shared/gfn";
 import { useTranslation } from "../i18n";
 import { OpenNowLogoMark } from "./OpenNowLogoMark";
@@ -16,6 +16,27 @@ export interface LoginScreenProps {
   statusMessage?: string;
 }
 
+// Parses code + state out of a localhost:2259 redirect URL.
+// Handles both standard URL format and regex fallback for malformed URLs.
+function extractCodeFromUrl(href: string): { code: string; state: string } | null {
+  try {
+    const u = new URL(href);
+    const code = u.searchParams.get("code");
+    const state = u.searchParams.get("state");
+    if (code && state) return { code, state };
+  } catch {
+    const codeMatch = href.match(/[?&]code=([^&]+)/);
+    const stateMatch = href.match(/[?&]state=([^&]+)/);
+    if (codeMatch && stateMatch) {
+      return {
+        code: decodeURIComponent(codeMatch[1]),
+        state: decodeURIComponent(stateMatch[1]),
+      };
+    }
+  }
+  return null;
+}
+
 export function LoginScreen({
   providers,
   selectedProviderId,
@@ -29,6 +50,61 @@ export function LoginScreen({
   const { t } = useTranslation();
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // ── Paste-URL modal state (self-contained, no CustomEvent needed) ──────────
+  const [pasteModalOpen, setPasteModalOpen] = useState(false);
+  const [pasteValue, setPasteValue] = useState("");
+  const [pasteError, setPasteError] = useState<string | null>(null);
+  const [pasteLoading, setPasteLoading] = useState(false);
+  const pasteInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (pasteModalOpen) {
+      setPasteValue("");
+      setPasteError(null);
+      setTimeout(() => pasteInputRef.current?.focus(), 50);
+    }
+  }, [pasteModalOpen]);
+
+  // Close modal on Escape
+  useEffect(() => {
+    if (!pasteModalOpen) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPasteModalOpen(false);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [pasteModalOpen]);
+
+  async function handlePasteSubmit() {
+    setPasteError(null);
+    const extracted = extractCodeFromUrl(pasteValue.trim());
+    if (!extracted) {
+      setPasteError(
+        "Couldn't find a code= and state= in that URL. Make sure you copied the full address bar URL."
+      );
+      return;
+    }
+    setPasteLoading(true);
+    try {
+      const res = await fetch("/api/auth/exchange", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: extracted.code, state: extracted.state }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({})) as { error?: string };
+        throw new Error(body.error ?? `Server error ${res.status}`);
+      }
+      // Exchange succeeded — close modal and let App.tsx reload the session
+      setPasteModalOpen(false);
+      onLogin();
+    } catch (e) {
+      setPasteError(e instanceof Error ? e.message : "Exchange failed — try again.");
+    } finally {
+      setPasteLoading(false);
+    }
+  }
 
   const selectedProvider = providers.find((p) => p.idpId === selectedProviderId);
   const title = isInitializing ? t("auth.title.restoringSession") : t("auth.title.signIn");
@@ -146,10 +222,158 @@ export function LoginScreen({
               </>
             )}
           </button>
+
+          {/* ── Paste redirect URL button ─────────────────────────────────── */}
+          {/* Shown when NVIDIA redirects to localhost:2259 and the popup closes
+              without completing auth. The user copies the URL from the popup's
+              address bar and pastes it here to finish the exchange manually.  */}
+          <button
+            type="button"
+            onClick={() => setPasteModalOpen(true)}
+            disabled={isLoading || isInitializing}
+            style={{
+              marginTop: "10px",
+              width: "100%",
+              background: "transparent",
+              border: "1px solid rgba(255,255,255,0.12)",
+              borderRadius: "8px",
+              color: "rgba(255,255,255,0.5)",
+              fontSize: "0.8em",
+              padding: "8px 12px",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: "6px",
+              transition: "border-color 0.15s, color 0.15s",
+            }}
+            onMouseEnter={e => {
+              (e.currentTarget as HTMLButtonElement).style.borderColor = "rgba(255,255,255,0.3)";
+              (e.currentTarget as HTMLButtonElement).style.color = "rgba(255,255,255,0.75)";
+            }}
+            onMouseLeave={e => {
+              (e.currentTarget as HTMLButtonElement).style.borderColor = "rgba(255,255,255,0.12)";
+              (e.currentTarget as HTMLButtonElement).style.color = "rgba(255,255,255,0.5)";
+            }}
+          >
+            <Link size={13} />
+            Signed in but stuck? Paste redirect URL
+          </button>
         </div>
 
         <p className="login-footer">{t("app.tagline")}</p>
       </div>
+
+      {/* ── Paste URL modal ─────────────────────────────────────────────────── */}
+      {pasteModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Paste redirect URL"
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 9999,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          {/* Backdrop */}
+          <div
+            onClick={() => setPasteModalOpen(false)}
+            style={{
+              position: "absolute",
+              inset: 0,
+              background: "rgba(0,0,0,0.65)",
+              backdropFilter: "blur(4px)",
+            }}
+          />
+
+          {/* Card */}
+          <div
+            style={{
+              position: "relative",
+              background: "#1a1a2e",
+              border: "1px solid rgba(255,255,255,0.12)",
+              borderRadius: "14px",
+              padding: "28px 28px 24px",
+              width: "min(480px, calc(100vw - 32px))",
+              boxShadow: "0 24px 64px rgba(0,0,0,0.6)",
+            }}
+          >
+            <div style={{ fontSize: "0.72em", textTransform: "uppercase", letterSpacing: "0.08em", color: "rgba(255,255,255,0.4)", marginBottom: "8px" }}>
+              Action required
+            </div>
+            <h3 style={{ margin: "0 0 10px", fontSize: "1.1em", fontWeight: 600 }}>
+              Paste the redirect URL
+            </h3>
+            <p style={{ margin: "0 0 6px", fontSize: "0.85em", color: "rgba(255,255,255,0.65)", lineHeight: 1.5 }}>
+              After signing in, the NVIDIA popup tries to redirect to{" "}
+              <code style={{ fontSize: "0.9em", background: "rgba(255,255,255,0.08)", padding: "1px 5px", borderRadius: "4px" }}>localhost:2259</code>{" "}
+              which fails on a remote deployment. Copy the full URL from the popup&apos;s address bar and paste it below.
+            </p>
+            <p style={{ margin: "0 0 16px", fontSize: "0.78em", color: "rgba(255,255,255,0.4)" }}>
+              Looks like:{" "}
+              <code style={{ wordBreak: "break-all" }}>http://localhost:2259/?state=…&amp;code=…</code>
+            </p>
+
+            <input
+              ref={pasteInputRef}
+              type="text"
+              value={pasteValue}
+              onChange={e => { setPasteValue(e.target.value); setPasteError(null); }}
+              onKeyDown={e => {
+                if (e.key === "Enter" && pasteValue.trim() && !pasteLoading) void handlePasteSubmit();
+                if (e.key === "Escape") setPasteModalOpen(false);
+              }}
+              placeholder="http://localhost:2259/?state=…&code=…"
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                padding: "9px 11px",
+                marginBottom: pasteError ? "8px" : "20px",
+                borderRadius: "7px",
+                border: `1px solid ${pasteError ? "rgba(255,80,80,0.6)" : "rgba(255,255,255,0.15)"}`,
+                background: "rgba(255,255,255,0.06)",
+                color: "inherit",
+                fontSize: "0.82em",
+                fontFamily: "monospace",
+                outline: "none",
+              }}
+            />
+
+            {pasteError && (
+              <p style={{ margin: "0 0 16px", fontSize: "0.78em", color: "rgba(255,100,100,0.9)", lineHeight: 1.4 }}>
+                {pasteError}
+              </p>
+            )}
+
+            <div style={{ display: "flex", gap: "10px", justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                onClick={() => setPasteModalOpen(false)}
+                disabled={pasteLoading}
+                className="logout-confirm-btn logout-confirm-btn-cancel"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handlePasteSubmit()}
+                disabled={!pasteValue.trim() || pasteLoading}
+                className="logout-confirm-btn logout-confirm-btn-confirm"
+              >
+                {pasteLoading ? (
+                  <><span className="login-spinner" style={{ width: "12px", height: "12px" }} /> Exchanging…</>
+                ) : (
+                  "Complete sign-in"
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
